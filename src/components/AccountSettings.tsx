@@ -7,8 +7,10 @@ import {
   ExternalLink,
   Lock,
   Mail,
+  MapPin,
   Phone,
   ShieldCheck,
+  Trash2,
   UserRound,
   X,
 } from 'lucide-react';
@@ -70,7 +72,7 @@ interface VerifyModalProps {
   user: UserProfile;
   change: PendingChange;
   onCancel: () => void;
-  onVerified: (result: { user: UserProfile; notifications: NotificationPreferences }) => void;
+  onVerified: (result: { user: UserProfile; notifications: NotificationPreferences }) => Promise<void> | void;
 }
 
 const VerifyModal: React.FC<VerifyModalProps> = ({
@@ -149,7 +151,7 @@ const VerifyModal: React.FC<VerifyModalProps> = ({
         setAttempts((count) => count + 1);
         throw new Error(payload.error || 'No se pudo confirmar el código.');
       }
-      onVerified(payload);
+      await onVerified(payload);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -241,7 +243,8 @@ const VerifyModal: React.FC<VerifyModalProps> = ({
 
 interface AccountSettingsProps {
   user: UserProfile;
-  onUpdateProfile?: (updated: Partial<UserProfile>) => void;
+  onUpdateProfile?: (updated: Partial<UserProfile>) => Promise<void> | void;
+  onAccountDeleted?: () => void;
 }
 
 const inputClass =
@@ -250,6 +253,7 @@ const inputClass =
 export const AccountSettings: React.FC<AccountSettingsProps> = ({
   user,
   onUpdateProfile,
+  onAccountDeleted,
 }) => {
   const [message, setMessage] = useState<{ type: 'ok' | 'error'; text: string } | null>(null);
   const [pending, setPending] = useState<PendingChange | null>(null);
@@ -257,6 +261,16 @@ export const AccountSettings: React.FC<AccountSettingsProps> = ({
   const [newEmail, setNewEmail] = useState('');
   const [name, setName] = useState(user.name);
   const [phone, setPhone] = useState(user.phone || '');
+  const [farmAddress, setFarmAddress] = useState(user.farmAddress || '');
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [passwordSaving, setPasswordSaving] = useState(false);
+  const [deletionEmail, setDeletionEmail] = useState('');
+  const [deletionConfirmation, setDeletionConfirmation] = useState('');
+  const [deletionPassword, setDeletionPassword] = useState('');
+  const [deletionError, setDeletionError] = useState('');
+  const [deletionPending, setDeletionPending] = useState(false);
 
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [quoteNotifications, setQuoteNotifications] = useState(true);
@@ -277,6 +291,45 @@ export const AccountSettings: React.FC<AccountSettingsProps> = ({
 
   const ok = (text: string) => setMessage({ type: 'ok', text });
   const fail = (text: string) => setMessage({ type: 'error', text });
+
+  const deleteAccount = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setDeletionError('');
+    setDeletionPending(true);
+    try {
+      const response = await fetch('/api/account', {
+        method: 'DELETE',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: deletionEmail.trim(),
+          confirmation: deletionConfirmation,
+          currentPassword: deletionPassword,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || 'No se pudo eliminar la cuenta.');
+      }
+
+      try {
+        const users: UserProfile[] = JSON.parse(
+          localStorage.getItem('agrocordoba_registered_users') || '[]'
+        );
+        localStorage.setItem(
+          'agrocordoba_registered_users',
+          JSON.stringify(users.filter((savedUser) => savedUser.email.toLowerCase() !== user.email.toLowerCase()))
+        );
+      } catch (error) {
+        console.error('No se pudo limpiar el perfil local tras eliminar la cuenta:', error);
+      }
+      onAccountDeleted?.();
+    } catch (error) {
+      setDeletionError((error as Error).message || 'No se pudo eliminar la cuenta.');
+    } finally {
+      setDeletionPending(false);
+    }
+  };
 
   const requestNameChange = () => {
     setMessage(null);
@@ -306,13 +359,56 @@ export const AccountSettings: React.FC<AccountSettingsProps> = ({
     setPending({ phone: phone.trim() });
   };
 
+  const saveFarmAddress = async () => {
+    setMessage(null);
+    if (farmAddress.trim().length > 500) {
+      return fail('La dirección no puede superar 500 caracteres.');
+    }
+    try {
+      await onUpdateProfile?.({ farmAddress: farmAddress.trim() });
+      ok('Dirección privada de recogida actualizada.');
+    } catch (error) {
+      fail((error as Error).message || 'No se pudo guardar la dirección.');
+    }
+  };
+
   /* ---------- Contraseña ---------- */
+  const changePassword = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setMessage(null);
+    if (newPassword !== confirmPassword) {
+      return fail('La confirmación no coincide con la nueva contraseña.');
+    }
+    if (newPassword.length < 8 || newPassword.length > 256) {
+      return fail('La nueva contraseña debe tener entre 8 y 256 caracteres.');
+    }
+
+    setPasswordSaving(true);
+    try {
+      const response = await fetch('/api/account/password', {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || 'No se pudo cambiar la contraseña.');
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+      ok(payload.message || 'Contraseña actualizada correctamente.');
+    } catch (error) {
+      fail((error as Error).message || 'No se pudo cambiar la contraseña.');
+    } finally {
+      setPasswordSaving(false);
+    }
+  };
 
   /* ---------- Código verificado ---------- */
 
-  const handleVerified = (result: { user: UserProfile; notifications: NotificationPreferences }) => {
+  const handleVerified = async (result: { user: UserProfile; notifications: NotificationPreferences }) => {
     if (!pending) return;
-    onUpdateProfile?.({
+    await onUpdateProfile?.({
       name: result.user.name,
       email: result.user.email,
       phone: result.user.phone,
@@ -453,6 +549,39 @@ export const AccountSettings: React.FC<AccountSettingsProps> = ({
         </div>
       </section>
 
+      {user.role === 'productor' && (
+        <section className="rounded-2xl border border-[#D9DED6] bg-white p-6 shadow-sm sm:p-7">
+          {sectionTitle(
+            <MapPin size={21} />,
+            'bg-emerald-50 text-emerald-700',
+            'Punto de recogida',
+            'Dirección privada de tu finca o lugar acordado para recoger.'
+          )}
+          <label className="block text-sm font-medium text-[#18241D]">
+            Dirección
+            <textarea
+              maxLength={500}
+              rows={3}
+              autoComplete="street-address"
+              value={farmAddress}
+              onChange={(event) => setFarmAddress(event.target.value)}
+              placeholder="Dirección, municipio y una referencia útil para llegar"
+              className="mt-1 w-full rounded-xl border border-[#D9DED6] bg-white px-4 py-3 outline-none focus:border-[#1F4D36] focus:ring-2 focus:ring-[#1F4D36]/15"
+            />
+          </label>
+          <p className="mt-2 text-xs leading-5 text-[#5B665F]">
+            No aparece en tu perfil público. Solo se muestra al comprador de una cotización cuando aceptas el acuerdo de recogida.
+          </p>
+          <button
+            type="button"
+            onClick={() => void saveFarmAddress()}
+            className="mt-4 rounded-xl bg-[#1F4D36] px-5 py-3 font-semibold text-white transition-colors hover:bg-[#18241D]"
+          >
+            Guardar dirección privada
+          </button>
+        </section>
+      )}
+
       {/* CONTRASEÑA */}
       <section className="rounded-2xl border border-[#D9DED6] bg-white p-6 shadow-sm sm:p-7">
         {sectionTitle(
@@ -461,24 +590,68 @@ export const AccountSettings: React.FC<AccountSettingsProps> = ({
           'Contraseña',
           user.authProvider === 'google'
             ? 'La contraseña de tu cuenta Google se administra directamente con Google.'
-            : 'Esta cuenta usa correo y contrasena; el cambio desde el perfil aun no esta habilitado.'
+            : 'Confirma tu contraseña actual para guardar una nueva.'
         )}
-        <div className="flex items-start gap-3 rounded-xl border border-[#e7e1cc] bg-[#fcfaf3] p-4 text-sm leading-6 text-[#665b3c]">
-          <ShieldCheck size={19} className="mt-0.5 shrink-0 text-[#8d7733]" aria-hidden="true" />
-          <div>
-            <p>
-              {user.authProvider === 'google'
-                ? 'Para cambiar tu contraseña, abre la configuración de seguridad de tu cuenta Google.'
-                : 'La gestion del cambio de contrasena segura se conectara en una siguiente etapa.'
-              }
-            </p>
-            {user.authProvider === 'google' && (
+        {user.authProvider === 'google' ? (
+          <div className="flex items-start gap-3 rounded-xl border border-[#e7e1cc] bg-[#fcfaf3] p-4 text-sm leading-6 text-[#665b3c]">
+            <ShieldCheck size={19} className="mt-0.5 shrink-0 text-[#8d7733]" aria-hidden="true" />
+            <div>
+              <p>Para cambiar tu contraseña, abre la configuración de seguridad de tu cuenta Google.</p>
               <a href="https://myaccount.google.com/security" target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1.5 font-semibold text-[#1f4d36] underline underline-offset-2 hover:text-[#173b2b]">
                 Abrir seguridad de Google <ExternalLink size={14} />
               </a>
-            )}
+            </div>
           </div>
-        </div>
+        ) : (
+          <form onSubmit={changePassword} className="space-y-3">
+            <label className="block text-sm font-medium text-[#18241D]">
+              Contraseña actual
+              <input
+                type="password"
+                autoComplete="current-password"
+                required
+                value={currentPassword}
+                onChange={(event) => setCurrentPassword(event.target.value)}
+                className="mt-1 w-full rounded-xl border border-[#D9DED6] bg-white px-4 py-3 outline-none transition focus:border-[#1F4D36] focus:ring-2 focus:ring-[#1F4D36]/15"
+              />
+            </label>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="block text-sm font-medium text-[#18241D]">
+                Nueva contraseña
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  minLength={8}
+                  maxLength={256}
+                  required
+                  value={newPassword}
+                  onChange={(event) => setNewPassword(event.target.value)}
+                  className="mt-1 w-full rounded-xl border border-[#D9DED6] bg-white px-4 py-3 outline-none transition focus:border-[#1F4D36] focus:ring-2 focus:ring-[#1F4D36]/15"
+                />
+              </label>
+              <label className="block text-sm font-medium text-[#18241D]">
+                Confirmar nueva contraseña
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  minLength={8}
+                  maxLength={256}
+                  required
+                  value={confirmPassword}
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                  className="mt-1 w-full rounded-xl border border-[#D9DED6] bg-white px-4 py-3 outline-none transition focus:border-[#1F4D36] focus:ring-2 focus:ring-[#1F4D36]/15"
+                />
+              </label>
+            </div>
+            <button
+              type="submit"
+              disabled={passwordSaving || !currentPassword || !newPassword || !confirmPassword}
+              className="rounded-xl bg-[#1F4D36] px-5 py-3 font-semibold text-white transition-colors hover:bg-[#18241D] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {passwordSaving ? 'Actualizando…' : 'Cambiar contraseña'}
+            </button>
+          </form>
+        )}
       </section>
 
       {/* NOTIFICACIONES */}
@@ -536,6 +709,72 @@ export const AccountSettings: React.FC<AccountSettingsProps> = ({
           <CheckCircle2 size={18} /> Guardar preferencias
         </button>
       </section>
+
+      {user.authProvider && (user.role === 'cliente' || user.role === 'productor') && (
+        <section className="rounded-2xl border border-red-200 bg-white p-6 shadow-sm sm:p-7">
+          {sectionTitle(
+            <Trash2 size={21} />,
+            'bg-red-50 text-red-700',
+            'Eliminar cuenta',
+            'La eliminación es permanente y no se puede deshacer.'
+          )}
+          <p className="mb-4 text-sm leading-6 text-[#5B665F]">
+            Se borrarán tu perfil, publicaciones, cotizaciones, conversaciones y demás datos asociados.
+            Confirma tu correo y escribe <strong>ELIMINAR MI CUENTA</strong> para continuar.
+          </p>
+          <form onSubmit={deleteAccount} className="space-y-3">
+            <label className="block text-sm font-medium text-[#18241D]">
+              Correo de la cuenta
+              <input
+                type="email"
+                autoComplete="email"
+                required
+                value={deletionEmail}
+                onChange={(event) => setDeletionEmail(event.target.value)}
+                className="mt-1 w-full rounded-xl border border-[#D9DED6] bg-white px-4 py-3 outline-none focus:border-red-600 focus:ring-2 focus:ring-red-600/15"
+              />
+            </label>
+            {user.authProvider === 'local' && (
+              <label className="block text-sm font-medium text-[#18241D]">
+                Contraseña actual
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  required
+                  value={deletionPassword}
+                  onChange={(event) => setDeletionPassword(event.target.value)}
+                  className="mt-1 w-full rounded-xl border border-[#D9DED6] bg-white px-4 py-3 outline-none focus:border-red-600 focus:ring-2 focus:ring-red-600/15"
+                />
+              </label>
+            )}
+            <label className="block text-sm font-medium text-[#18241D]">
+              Confirmación
+              <input
+                type="text"
+                required
+                value={deletionConfirmation}
+                onChange={(event) => setDeletionConfirmation(event.target.value)}
+                placeholder="ELIMINAR MI CUENTA"
+                className="mt-1 w-full rounded-xl border border-[#D9DED6] bg-white px-4 py-3 outline-none focus:border-red-600 focus:ring-2 focus:ring-red-600/15"
+              />
+            </label>
+            {deletionError && <p role="alert" className="text-sm text-red-700">{deletionError}</p>}
+            <button
+              type="submit"
+              disabled={
+                deletionPending ||
+                deletionEmail.trim().toLowerCase() !== user.email.toLowerCase() ||
+                deletionConfirmation !== 'ELIMINAR MI CUENTA' ||
+                (user.authProvider === 'local' && !deletionPassword)
+              }
+              className="inline-flex items-center gap-2 rounded-xl bg-red-700 px-5 py-3 font-semibold text-white transition-colors hover:bg-red-800 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Trash2 size={17} />
+              {deletionPending ? 'Eliminando cuenta…' : 'Eliminar mi cuenta definitivamente'}
+            </button>
+          </form>
+        </section>
+      )}
 
       {pending && (
         <VerifyModal

@@ -12,7 +12,7 @@ export const HowItWorks: React.FC<HowItWorksProps> = ({ onExploreCatalog, onOpen
       step: '01',
       badge: 'Explora Cosechas',
       title: 'Encuentra productos de la región',
-      desc: 'Explora las fichas disponibles y revisa el origen, el precio publicado y los datos de contacto de cada productor.',
+      desc: 'Explora las fichas disponibles y compara el origen, el precio publicado y la referencia mayorista oficial.',
       icon: Search,
       color: 'from-emerald-600 to-[#003622]',
       bgLight: 'bg-[#f4f2e9]',
@@ -43,14 +43,14 @@ export const HowItWorks: React.FC<HowItWorksProps> = ({ onExploreCatalog, onOpen
     },
     {
       step: '04',
-      badge: 'Trato Directo WhatsApp',
-      title: 'Acuerda los detalles con el productor',
-      desc: 'Cuando tengas la información, puedes continuar la conversación por WhatsApp y definir juntos los siguientes pasos.',
+      badge: 'Chat en AgroCórdoba',
+      title: 'Negocia dentro de la plataforma',
+      desc: 'Conversa en tiempo real, envía contraofertas estructuradas y conserva el estado de cada cotización.',
       icon: MessageSquare,
       color: 'from-emerald-700 to-[#134e35]',
       bgLight: 'bg-[#f4f2e9]',
       border: 'border-[#e4dfd2]',
-      tag: 'Trato directo',
+      tag: 'Mensajes en tiempo real',
     },
   ];
 

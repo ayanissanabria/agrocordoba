@@ -23,6 +23,8 @@ import { ProductCatalog } from '../components/ProductCatalog';
 import { ProductModal } from '../components/ProductModal';
 import { AccountSettings } from '../components/AccountSettings';
 import { AgroCordobaBrand } from '../components/AgroCordobaBrand';
+import { PriceReferencePanel } from '../components/PriceReferencePanel';
+import { QuotationConversation } from '../components/QuotationConversation';
 
 import { INITIAL_PRODUCTS } from '../data/mockData';
 
@@ -62,9 +64,13 @@ interface BuyerDashboardProps {
   quotations?: QuotationRequest[];
   onOpenProductModal?: (product: Product) => void;
   onNavigate?: (section: string) => void;
-  onUpdateProfile?: (updated: Partial<UserProfile>) => void;
+  onUpdateProfile?: (updated: Partial<UserProfile>) => Promise<void> | void;
+  onUpdateQuotationStatus?: (id: string, status: QuotationRequest['status']) => Promise<void> | void;
+  unreadMessageCounts?: Record<string, number>;
   onLogout?: () => void;
-  onSubmitQuotation?: (quotation: Omit<QuotationRequest, 'id' | 'createdAt' | 'status'>) => Promise<void> | void;
+  openChatQuotationId?: string | null;
+  onQuotationChatOpened?: (quotationId: string) => void;
+  onSubmitQuotation?: (quotation: Omit<QuotationRequest, 'id' | 'createdAt' | 'status'>) => Promise<QuotationRequest | void> | QuotationRequest | void;
 }
 
 type Section =
@@ -159,9 +165,9 @@ const buildDemoHistory = (user: UserProfile): QuotationRequest[] => {
   const now = new Date();
   type Row = [number, string, string, string, string, string, string, number, number, QuotationRequest['status']?];
   const rows: Row[] = [
-    // [meses atrás, productId, producto, variedad, productor, asociación, whatsapp, kg, $/kg, estado]
+    // [meses atrás, productId, producto, variedad, productor, asociación, teléfono, kg, $/kg, estado]
     [0, 'prod-1', 'Plátano', 'Plátano', 'Carmelo Doria Martínez', 'ASOPROAGRO Cereté', '573104529811', 850, 2800, 'Pendiente'],
-    [0, 'prod-6', 'Maíz', 'Maíz amarillo', 'Jairo Mercado Guzmán', 'ASOSEMILLAS del Sinú', '573126549921', 1000, 1650, 'Contactado WhatsApp'],
+    [0, 'prod-6', 'Maíz', 'Maíz amarillo', 'Jairo Mercado Guzmán', 'ASOSEMILLAS del Sinú', '573126549921', 1000, 1650, 'En negociación'],
     [5, 'prod-1', 'Plátano', 'Plátano', 'Carmelo Doria Martínez', 'ASOPROAGRO Cereté', '573104529811', 600, 3050],
     [5, 'prod-4', 'Yuca', 'Yuca para consumo', 'Efraín Morelo Cogollo', 'Cooperativa COOPCASABE', '573118932410', 500, 2000],
     [4, 'prod-1', 'Plátano', 'Plátano', 'Carmelo Doria Martínez', 'ASOPROAGRO Cereté', '573104529811', 700, 3000],
@@ -363,7 +369,11 @@ const Empty: React.FC<{ title: string; text: string; action?: { label: string; o
 const STATUS_TEXT: Record<QuotationRequest['status'], { label: string; color: string; weight: number }> = {
   Pendiente: { label: 'Escríbele', color: '#8A5A00', weight: 700 },
   Cotizado: { label: 'Cotizado', color: '#8A5A00', weight: 700 },
+  'En negociación': { label: 'En negociación', color: '#8A5A00', weight: 700 },
+  Acordado: { label: 'Acordado', color: C.monte, weight: 700 },
   'Contactado WhatsApp': { label: 'En conversación', color: C.monte, weight: 700 },
+  'Listo para recoger': { label: 'Listo para recoger', color: C.monte, weight: 700 },
+  Entregado: { label: 'Entregado', color: C.monte, weight: 700 },
   Cerrado: { label: 'Cerrado', color: C.gris, weight: 400 },
 };
 
@@ -372,10 +382,15 @@ const StatusText: React.FC<{ status: QuotationRequest['status'] }> = ({ status }
   return <span style={{ color: s.color, fontWeight: s.weight }}>{s.label}</span>;
 };
 
-const STEPS = ['Solicitud enviada', 'Contacto por WhatsApp', 'Negocio cerrado'];
+const STEPS = ['Solicitud enviada', 'Negociación', 'Acuerdo', 'Entrega o recogida', 'Cierre confirmado'];
 
-const stepIndex = (status: QuotationRequest['status']) =>
-  status === 'Cerrado' ? 3 : status === 'Contactado WhatsApp' ? 2 : 1;
+const stepIndex = (status: QuotationRequest['status']) => {
+  if (status === 'Cerrado') return 5;
+  if (status === 'Entregado' || status === 'Listo para recoger') return 4;
+  if (status === 'Acordado') return 3;
+  if (['Contactado WhatsApp', 'En negociación', 'Cotizado'].includes(status)) return 2;
+  return 1;
+};
 
 const Steps: React.FC<{ status: QuotationRequest['status'] }> = ({ status }) => {
   const done = stepIndex(status);
@@ -416,7 +431,11 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
   onOpenProductModal,
   onNavigate,
   onUpdateProfile,
+  onUpdateQuotationStatus,
+  unreadMessageCounts = {},
   onLogout,
+  openChatQuotationId,
+  onQuotationChatOpened,
   onSubmitQuotation,
 }) => {
   /* ---------- Letra ---------- */
@@ -447,7 +466,7 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [localQuotations, setLocalQuotations] = useState<QuotationRequest[]>([]);
   const [photoMessage, setPhotoMessage] = useState('');
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [quotationActionError, setQuotationActionError] = useState('');
 
   // Cambios de estado de los pedidos de ejemplo de la cuenta demo
   const [demoStatus, setDemoStatus] = useState<Record<string, QuotationRequest['status']>>(() => {
@@ -539,10 +558,20 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
     );
   }, [availableQuotations, user, demoStatus]);
 
+  useEffect(() => {
+    if (openChatQuotationId && myQuotations.some((quotation) => quotation.id === openChatQuotationId)) {
+      setSection('pedidos');
+    }
+  }, [openChatQuotationId, myQuotations]);
+
   const openQuotations = myQuotations.filter((q) => q.status !== 'Cerrado');
   const waiting = myQuotations.filter((q) => q.status === 'Pendiente' || q.status === 'Cotizado');
   const unreadNotificationCount = waiting.filter((q) => !readNotificationIds.includes(q.id)).length;
   const closed = myQuotations.filter((q) => q.status === 'Cerrado');
+  const unreadMessageCount = myQuotations.reduce(
+    (total, quotation) => total + (unreadMessageCounts[quotation.id] || 0),
+    0
+  );
   const favoriteProducts = availableProducts.filter((p) => favorites.includes(p.id));
 
   /* ---------- Navegación ---------- */
@@ -592,7 +621,8 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
     go('pedidos');
   };
 
-  const setStatus = (id: string, status: QuotationRequest['status']) => {
+  const setStatus = async (id: string, status: QuotationRequest['status']) => {
+    setQuotationActionError('');
     if (id.startsWith('demo-hist-')) {
       const next = { ...demoStatus, [id]: status };
       setDemoStatus(next);
@@ -603,16 +633,15 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
       }
       return;
     }
+    if (!id.startsWith('demo-hist-') && onUpdateQuotationStatus) {
+      try {
+        await onUpdateQuotationStatus(id, status);
+      } catch (error) {
+        setQuotationActionError((error as Error).message || 'No se pudo actualizar el pedido.');
+      }
+      return;
+    }
     saveLocal(localQuotations.map((q) => (q.id === id ? { ...q, status } : q)));
-  };
-
-  const whatsappLink = (q: QuotationRequest) => {
-    const msg =
-      `Hola ${q.producerName.split(' ')[0]}, soy ${user.name}` +
-      `${user.businessType ? ` (${user.businessType}, ${user.city})` : ''}. ` +
-      `Le escribo por mi solicitud en AgroCórdoba: ${kg(q.quantityKg)} de ${q.productName}, ` +
-      `valor estimado ${cop(q.totalCop)}. ¿Tiene disponibilidad?`;
-    return `https://wa.me/${q.producerWhatsapp.replace(/\D/g, '')}?text=${encodeURIComponent(msg)}`;
   };
 
   const toggleFavorite = (productId: string) => {
@@ -644,30 +673,31 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
   };
 
   /* ---------- Foto de perfil ---------- */
-  const pickPhoto = () => {
-    setPhotoMessage('');
-    fileInputRef.current?.click();
-  };
-
   const handlePhotoChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = '';
     if (!file) return;
-    if (!file.type.startsWith('image/')) return setPhotoMessage('Selecciona una imagen JPG o PNG.');
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+      return setPhotoMessage('Selecciona una imagen JPG, PNG o WebP.');
+    }
     if (file.size > 10 * 1024 * 1024) return setPhotoMessage('La imagen no puede superar los 10 MB.');
     try {
       const avatar = await resizeImage(file);
-      onUpdateProfile?.({ avatar });
+      await onUpdateProfile?.({ avatar });
       setPhotoMessage(user.avatar ? 'Foto actualizada.' : 'Foto agregada.');
     } catch (error) {
-      setPhotoMessage((error as Error).message);
+      setPhotoMessage((error as Error).message || 'No se pudo guardar la foto.');
     }
   };
 
-  const deletePhoto = () => {
+  const deletePhoto = async () => {
     if (!window.confirm('¿Eliminar tu foto de perfil?')) return;
-    onUpdateProfile?.({ avatar: '' });
-    setPhotoMessage('Foto eliminada.');
+    try {
+      await onUpdateProfile?.({ avatar: '' });
+      setPhotoMessage('Foto eliminada.');
+    } catch (error) {
+      setPhotoMessage((error as Error).message || 'No se pudo eliminar la foto.');
+    }
   };
 
   /* ============================================================
@@ -794,7 +824,7 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
 
   const QuotationTable: React.FC<{ rows: QuotationRequest[]; compact?: boolean }> = ({ rows, compact }) => (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[520px] text-[13px]">
+      <table className="w-full min-w-[620px] text-[13px]">
         <thead>
           <tr style={{ color: C.gris }}>
             <th className="px-4 py-2 text-left text-xs font-medium">Producto</th>
@@ -802,6 +832,7 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
             {!compact && <th className="px-4 py-2 text-left text-xs font-medium">Fecha</th>}
             <th className="px-4 py-2 text-right text-xs font-medium">Valor</th>
             <th className="px-4 py-2 text-left text-xs font-medium">Estado</th>
+            <th className="px-4 py-2 text-left text-xs font-medium">Conversación</th>
           </tr>
         </thead>
         <tbody>
@@ -814,6 +845,16 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
               {!compact && <td className="px-4 py-2.5" style={{ color: C.gris }}>{q.createdAt.split(' ')[0]}</td>}
               <td className="px-4 py-2.5 text-right">{cop(q.totalCop)}</td>
               <td className="px-4 py-2.5"><StatusText status={q.status} /></td>
+              <td className="px-4 py-2.5">
+                {(unreadMessageCounts[q.id] || 0) > 0 && (
+                  <span className="mb-1 inline-block rounded-full bg-red-100 px-2 py-0.5 text-[11px] font-bold text-red-800">
+                    {unreadMessageCounts[q.id]} sin leer
+                  </span>
+                )}
+                {q.clientId && q.producerId
+                  ? <QuotationConversation quotationId={q.id} currentUserId={user.id} participantName={q.producerName} productName={q.productName} quotationStatus={q.status} initialUnitPrice={q.quantityKg > 0 ? q.subtotalCop / q.quantityKg : 0} initialQuantityKg={q.quantityKg} initialFreightCop={q.freightCop} fulfillmentMethod={q.fulfillmentMethod} paymentMethod={q.paymentMethod} deliveryAddress={q.deliveryAddress} deliveryLatitude={q.deliveryLatitude} deliveryLongitude={q.deliveryLongitude} producerPickupAddress={q.producerPickupAddress} compact />
+                  : <span style={{ color: C.gris }}>—</span>}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -892,19 +933,17 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
                 <QuotationTable rows={myQuotations.slice(0, 4)} compact />
                 {nextUp && (
                   <div className="flex flex-wrap items-center gap-3 border-t px-4 py-3" style={{ borderColor: C.lineaSuave }}>
-                    <a
-                      href={whatsappLink(nextUp)}
-                      target="_blank"
-                      rel="noreferrer"
-                      onClick={() => setStatus(nextUp.id, 'Contactado WhatsApp')}
-                      className="inline-flex items-center gap-2 rounded px-3.5 py-2 text-[13px] font-bold text-white hover:opacity-90"
-                      style={{ background: C.monte }}
+                    <button
+                      type="button"
+                      onClick={() => go('pedidos')}
+                      className="inline-flex items-center gap-2 rounded border px-3.5 py-2 text-[13px] font-bold hover:bg-[#F7F8F5]"
+                      style={{ borderColor: C.linea, color: C.monte }}
                     >
                       <MessageCircle size={16} />
-                      Escribir a {nextUp.producerName.split(' ')[0]}
-                    </a>
+                      Ver conversación
+                    </button>
                     <span className="text-xs" style={{ color: C.gris }}>
-                      Pedido de {nextUp.productName.toLowerCase()}, {kg(nextUp.quantityKg)}
+                      Conversación de {nextUp.productName.toLowerCase()}, {kg(nextUp.quantityKg)}
                     </span>
                   </div>
                 )}
@@ -982,11 +1021,13 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
               <p className="mt-1.5 text-[11px] text-[#9AA89E]">Promedio de los productores en el catálogo hoy.</p>
             </section>
 
+            <PriceReferencePanel productNames={availableProducts.map((product) => product.name)} />
+
             <div className="border-l-[3px] py-1 pl-3" style={{ borderColor: C.maiz }}>
               <p className="text-[13px] font-bold">Compra segura</p>
               <p className="mt-0.5 text-xs leading-relaxed" style={{ color: C.gris }}>
-                Habla solo al número del productor que aparece aquí. En el primer pedido, paga una parte al recibir.
-                Desconfía si te piden pagar a nombre de otra persona.
+                Mantén los acuerdos en el chat de AgroCórdoba y confirma las condiciones antes de pagar.
+                AgroCórdoba no recibe ni procesa pagos.
               </p>
             </div>
           </div>
@@ -1001,7 +1042,7 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
 
   const renderCatalogo = () => (
     <>
-      <PageHeader title="Catálogo" subtitle="Productos publicados por productores de Córdoba. Pide una cotización y acuerda la compra por WhatsApp." />
+      <PageHeader title="Catálogo" subtitle="Productos publicados por productores de Córdoba. Solicita una cotización y continúa la negociación en el chat de AgroCórdoba." />
       <ProductCatalog
         products={availableProducts}
         selectedMunicipality={selectedMunicipality}
@@ -1021,7 +1062,12 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
 
   const renderPedidos = () => (
     <>
-      <PageHeader title="Pedidos" subtitle="Tus solicitudes abiertas. Escríbele al productor y marca el pedido cuando lleguen a un acuerdo." />
+      <PageHeader title="Pedidos" subtitle="Sigue cada conversación, acuerdo y entrega hasta confirmar que recibiste el producto." />
+      {unreadMessageCount > 0 && (
+        <p role="status" className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-900">
+          Tienes {unreadMessageCount} {unreadMessageCount === 1 ? 'mensaje sin leer' : 'mensajes sin leer'} en tus conversaciones.
+        </p>
+      )}
       {openQuotations.length === 0 ? (
         <Empty
           title="No tienes pedidos abiertos"
@@ -1042,7 +1088,7 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
                   </p>
                 </div>
                 <div className="text-right">
-                  <p className="text-xs" style={{ color: C.gris }}>Valor estimado</p>
+                  <p className="text-xs" style={{ color: C.gris }}>{q.status === 'Acordado' || q.status === 'Entregado' || q.status === 'Listo para recoger' ? 'Valor acordado' : 'Valor estimado'}</p>
                   <p className="text-xl font-bold">{cop(q.totalCop)}</p>
                 </div>
               </div>
@@ -1050,27 +1096,54 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
               <div className="mt-4"><Steps status={q.status} /></div>
 
               <div className="mt-4 flex flex-wrap items-center gap-2 border-t pt-4" style={{ borderColor: C.lineaSuave }}>
-                <a
-                  href={whatsappLink(q)}
-                  target="_blank"
-                  rel="noreferrer"
-                  onClick={() => q.status !== 'Contactado WhatsApp' && setStatus(q.id, 'Contactado WhatsApp')}
-                  className="inline-flex items-center gap-2 rounded px-3.5 py-2 text-[13px] font-bold text-white hover:opacity-90"
-                  style={{ background: C.monte }}
-                >
-                  <MessageCircle size={16} />
-                  Escribir por WhatsApp
-                </a>
-                {q.status === 'Contactado WhatsApp' && (
+                {(unreadMessageCounts[q.id] || 0) > 0 && (
+                  <span className="rounded-full bg-red-100 px-2.5 py-1 text-xs font-bold text-red-800">
+                    {unreadMessageCounts[q.id]} {unreadMessageCounts[q.id] === 1 ? 'mensaje nuevo' : 'mensajes nuevos'}
+                  </span>
+                )}
+                {q.clientId && q.producerId && (
+                  <QuotationConversation
+                    quotationId={q.id}
+                    currentUserId={user.id}
+                    participantName={q.producerName}
+                    productName={q.productName}
+                    quotationStatus={q.status}
+                    initialUnitPrice={q.quantityKg > 0 ? q.subtotalCop / q.quantityKg : 0}
+                    initialQuantityKg={q.quantityKg}
+                    initialFreightCop={q.freightCop}
+                    fulfillmentMethod={q.fulfillmentMethod}
+                    paymentMethod={q.paymentMethod}
+                    deliveryAddress={q.deliveryAddress}
+                    deliveryLatitude={q.deliveryLatitude}
+                    deliveryLongitude={q.deliveryLongitude}
+                    producerPickupAddress={q.producerPickupAddress}
+                    autoOpen={openChatQuotationId === q.id}
+                    onAutoOpenHandled={() => onQuotationChatOpened?.(q.id)}
+                  />
+                )}
+                {q.status === 'Acordado' && (
+                  <span className="text-xs font-semibold text-[#285b3c]">El productor debe confirmar la entrega o preparar la recogida.</span>
+                )}
+                {(q.status === 'Entregado' || q.status === 'Listo para recoger') && user.authProvider && (
+                  <button
+                    onClick={() => void setStatus(q.id, 'Cerrado')}
+                    className="inline-flex items-center gap-2 rounded bg-[#1F4D36] px-3.5 py-2 text-[13px] font-bold text-white hover:bg-[#173b2b]"
+                  >
+                    <Check size={16} />
+                    Confirmar recepción y cerrar pedido
+                  </button>
+                )}
+                {(q.status === 'Entregado' || q.status === 'Listo para recoger') && !user.authProvider && (
                   <button
                     onClick={() => setStatus(q.id, 'Cerrado')}
                     className="inline-flex items-center gap-2 rounded border px-3.5 py-2 text-[13px] font-bold hover:bg-[#F7F8F5]"
                     style={{ borderColor: C.linea }}
                   >
                     <Check size={16} />
-                    Ya acordamos la compra
+                    Confirmar recepción y cerrar pedido
                   </button>
                 )}
+                {q.status === 'Cerrado' && <span role="status" className="text-xs font-bold text-[#285b3c]">Negocio cerrado: recepción confirmada por ti.</span>}
                 <span className="ml-auto text-xs" style={{ color: C.gris }}>Solicitado el {q.createdAt.split(' ')[0]}</span>
               </div>
             </Box>
@@ -1086,9 +1159,9 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
 
   const renderHistorial = () => (
     <>
-      <PageHeader title="Historial" subtitle="Compras que ya acordaste con los productores." />
+      <PageHeader title="Historial" subtitle="Compras cuya recepción ya confirmaste." />
       {closed.length === 0 ? (
-        <Empty title="Aún no tienes compras cerradas" text="Cuando marques un pedido como acordado, aparecerá aquí." />
+        <Empty title="Aún no tienes compras cerradas" text="Cuando confirmes que recibiste un pedido, aparecerá aquí." />
       ) : (
         <Box>
           <QuotationTable rows={closed} />
@@ -1151,15 +1224,15 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
         <div className="flex flex-col gap-5 sm:flex-row sm:items-center">
           <div className="relative w-fit">
             {avatar(104)}
-            <button
-              onClick={pickPhoto}
-              className="absolute bottom-0 right-0 flex h-9 w-9 items-center justify-center rounded-full border-[3px] border-white text-white"
+            <label
+              htmlFor="buyer-profile-photo"
+              className="absolute bottom-0 right-0 flex h-9 w-9 cursor-pointer items-center justify-center rounded-full border-[3px] border-white text-white"
               style={{ background: C.monte }}
               aria-label={user.avatar ? 'Cambiar foto' : 'Agregar foto'}
             >
               <Camera size={15} />
-            </button>
-            <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handlePhotoChange} />
+            </label>
+            <input id="buyer-profile-photo" type="file" accept="image/jpeg,image/png,image/webp" className="sr-only" onChange={handlePhotoChange} />
           </div>
 
           <div className="flex-1">
@@ -1168,10 +1241,10 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
               {user.businessType}, {user.city}
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
-              <button onClick={pickPhoto} className="inline-flex items-center gap-2 rounded border px-3 py-1.5 text-[13px] font-medium hover:bg-[#F7F8F5]" style={{ borderColor: C.linea }}>
+              <label htmlFor="buyer-profile-photo" className="inline-flex cursor-pointer items-center gap-2 rounded border px-3 py-1.5 text-[13px] font-medium hover:bg-[#F7F8F5]" style={{ borderColor: C.linea }}>
                 <Camera size={15} />
                 {user.avatar ? 'Cambiar foto' : 'Agregar foto'}
-              </button>
+              </label>
               {user.avatar && (
                 <button onClick={deletePhoto} className="inline-flex items-center gap-2 rounded px-3 py-1.5 text-[13px] font-medium text-[#A33A1F] hover:bg-[#FBEDE8]">
                   <Trash2 size={15} />
@@ -1179,7 +1252,15 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
                 </button>
               )}
             </div>
-            {photoMessage && <p role="status" className="mt-2 text-[13px] font-medium" style={{ color: C.monte }}>{photoMessage}</p>}
+            {photoMessage && (
+              <p
+                role="status"
+                className={`mt-2 text-[13px] font-medium ${photoMessage.startsWith('No se pudo') || photoMessage.startsWith('Selecciona') || photoMessage.startsWith('La imagen') ? 'text-red-700' : ''}`}
+                style={{ color: photoMessage.startsWith('No se pudo') || photoMessage.startsWith('Selecciona') || photoMessage.startsWith('La imagen') ? undefined : C.monte }}
+              >
+                {photoMessage}
+              </p>
+            )}
           </div>
         </div>
 
@@ -1216,7 +1297,7 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
   const renderConfiguracion = () => (
     <>
       <PageHeader title="Configuración" subtitle="Tu correo, tu WhatsApp, tu contraseña y tus avisos." />
-      <AccountSettings user={user} onUpdateProfile={onUpdateProfile} />
+      <AccountSettings user={user} onUpdateProfile={onUpdateProfile} onAccountDeleted={onLogout} />
     </>
   );
 
@@ -1230,10 +1311,10 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
     configuracion: renderConfiguracion,
   };
 
-  const tabs: { id: Section; label: string; badge?: number }[] = [
+  const tabs: { id: Section; label: string; badge?: number; unreadBadge?: number }[] = [
     { id: 'inicio', label: 'Inicio' },
     { id: 'catalogo', label: 'Catálogo' },
-    { id: 'pedidos', label: 'Pedidos', badge: waiting.length },
+    { id: 'pedidos', label: 'Pedidos', badge: waiting.length, unreadBadge: unreadMessageCount },
     { id: 'historial', label: 'Historial' },
     { id: 'favoritos', label: 'Favoritos', badge: favorites.length || undefined },
     { id: 'perfil', label: 'Mi perfil' },
@@ -1304,8 +1385,8 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
                   ) : (
                     waiting.slice(0, 4).map((q) => (
                       <button key={q.id} onClick={() => go('pedidos')} className="block w-full cursor-pointer border-b px-4 py-3 text-left text-[13px] last:border-0 hover:bg-[#F7F8F5]" style={{ borderColor: C.lineaSuave }}>
-                        <b>Escríbele a {q.producerName.split(' ')[0]}</b>
-                        <span className="block" style={{ color: C.gris }}>Tu pedido de {q.productName.toLowerCase()} ({kg(q.quantityKg)}) espera tu mensaje.</span>
+                        <b>Abre tu conversación con {q.producerName.split(' ')[0]}</b>
+                        <span className="block" style={{ color: C.gris }}>Tu pedido de {q.productName.toLowerCase()} ({kg(q.quantityKg)}) espera tu respuesta.</span>
                       </button>
                     ))
                   )}
@@ -1343,7 +1424,7 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
                 <div className="absolute right-0 top-12 w-52 rounded border bg-white py-1 shadow-lg" style={{ borderColor: C.linea }}>
                   {[
                     { label: 'Mi perfil', icon: <User size={16} />, onClick: () => go('perfil') },
-                    { label: user.avatar ? 'Cambiar foto' : 'Agregar foto', icon: <Camera size={16} />, onClick: () => { go('perfil'); window.setTimeout(pickPhoto, 0); } },
+                    { label: user.avatar ? 'Cambiar foto' : 'Agregar foto', icon: <Camera size={16} />, onClick: () => go('perfil') },
                     { label: 'Configuración', icon: <Settings size={16} />, onClick: () => go('configuracion') },
                   ].map((item) => (
                     <button key={item.label} onClick={item.onClick} className="flex w-full items-center gap-2.5 px-3.5 py-2 text-left text-[13px] hover:bg-[#F7F8F5]">
@@ -1388,6 +1469,11 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
                         {t.badge}
                       </span>
                     )}
+                    {!!t.unreadBadge && (
+                      <span className="rounded-full bg-red-100 px-1.5 py-0.5 text-[11px] font-bold text-red-800">
+                        {t.unreadBadge}
+                      </span>
+                    )}
                   </button>
                 </li>
               );
@@ -1425,7 +1511,14 @@ export const BuyerDashboard: React.FC<BuyerDashboardProps> = ({
       )}
 
       {/* CONTENIDO */}
-      <main className="mx-auto max-w-[1240px] overflow-x-hidden px-4 py-7 sm:px-6 sm:py-8">{content[section]()}</main>
+      <main className="mx-auto max-w-[1240px] overflow-x-hidden px-4 py-7 sm:px-6 sm:py-8">
+        {quotationActionError && (
+          <p role="alert" className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800">
+            {quotationActionError}
+          </p>
+        )}
+        {content[section]()}
+      </main>
 
       <footer className="mx-auto flex max-w-[1240px] items-center gap-2 px-4 pb-8 text-xs sm:px-6" style={{ color: C.gris }}>
         <ShieldCheck size={14} />

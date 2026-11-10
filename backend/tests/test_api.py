@@ -1,9 +1,12 @@
 from datetime import datetime, timezone
+from io import BytesIO
 import json
 import re
 
 from flask import redirect
+from openpyxl import Workbook
 
+import app as app_module
 from app import (
     AccountSettings,
     Favorite,
@@ -11,18 +14,32 @@ from app import (
     ProductCertification,
     ProducerProduct,
     ProductListing,
+    QuotationMessage,
+    QuotationOffer,
     QuotationRecord,
     ReadNotification,
+    SipsaPriceReference,
     SettingsVerification,
     User,
     app as flask_app,
     _apply_product_fields,
+    _get_database_url,
     _migrate_normalized_tables,
+    _migrate_user_columns,
     _product_payload,
     db,
     google,
+    socketio,
 )
 from sqlalchemy import inspect, text
+
+
+def test_database_url_defaults_to_local_sqlite_when_unset_or_blank(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert _get_database_url() == "sqlite:///agrocordoba.db"
+
+    monkeypatch.setenv("DATABASE_URL", " ")
+    assert _get_database_url() == "sqlite:///agrocordoba.db"
 
 
 def create_user(**overrides):
@@ -70,6 +87,22 @@ def test_me_returns_public_user_data(client):
     assert payload["city"] == "Montería"
     assert payload["status"] == "activo"
     assert "google_sub" not in payload
+
+
+def test_farm_address_is_returned_only_in_the_owner_account_payload(client):
+    producer = create_user(
+        google_sub="private-farm-address",
+        email="private-farm-address@example.com",
+        role="productor",
+        farm_address="Finca privada, vía Montería",
+    )
+
+    assert "farmAddress" not in producer.to_public_dict()
+    login_as(client, producer)
+    response = client.get("/api/auth/me")
+
+    assert response.status_code == 200
+    assert response.get_json()["user"]["farmAddress"] == "Finca privada, vía Montería"
 
 
 def test_me_clears_a_session_for_a_missing_user(client):
@@ -231,6 +264,205 @@ def create_quotation(client_id, producer_id, product_id="reference-product", **o
     db.session.add(quotation)
     db.session.flush()
     return quotation
+
+
+def test_quotation_delivery_details_are_hidden_until_agreement_and_can_be_closed(client):
+    buyer = create_user(
+        google_sub="delivery-buyer",
+        email="delivery-buyer@example.com",
+        role="cliente",
+    )
+    producer = create_user(
+        google_sub="delivery-producer",
+        email="delivery-producer@example.com",
+        role="productor",
+        status="activo",
+    )
+    quotation = create_quotation(
+        buyer.id,
+        producer.id,
+        status="Pendiente",
+        fulfillment_method="domicilio",
+        delivery_address="Calle 10 # 20-30",
+        delivery_latitude=8.75,
+        delivery_longitude=-75.88,
+        payment_method="efectivo",
+    )
+    db.session.commit()
+
+    login_as(client, buyer)
+    pending = client.get("/api/quotations").get_json()["quotations"][0]
+    assert "deliveryAddress" not in pending
+    assert "deliveryLatitude" not in pending
+
+    quotation.status = "Acordado"
+    db.session.commit()
+    agreed = client.get("/api/quotations").get_json()["quotations"][0]
+    assert agreed["deliveryAddress"] == "Calle 10 # 20-30"
+    assert agreed["deliveryLatitude"] == 8.75
+    assert agreed["paymentMethod"] == "efectivo"
+
+    producer_client = flask_app.test_client()
+    login_as(producer_client, producer)
+    delivered = producer_client.patch(
+        f"/api/quotations/{quotation.id}",
+        json={"status": "Entregado"},
+    )
+    assert delivered.status_code == 200
+    assert delivered.get_json()["quotation"]["status"] == "Entregado"
+
+    closed = client.patch(
+        f"/api/quotations/{quotation.id}",
+        json={"status": "Cerrado"},
+    )
+    assert closed.status_code == 200
+    assert closed.get_json()["quotation"]["status"] == "Cerrado"
+
+
+def test_pickup_requires_private_producer_address_before_ready_status(client):
+    buyer = create_user(
+        google_sub="pickup-buyer",
+        email="pickup-buyer@example.com",
+        role="cliente",
+    )
+    producer = create_user(
+        google_sub="pickup-producer",
+        email="pickup-producer@example.com",
+        role="productor",
+        status="activo",
+        farm_address="",
+    )
+    quotation = create_quotation(
+        buyer.id,
+        producer.id,
+        status="Acordado",
+        fulfillment_method="recoger",
+    )
+    db.session.commit()
+    login_as(client, producer)
+
+    missing_address = client.patch(
+        f"/api/quotations/{quotation.id}",
+        json={"status": "Listo para recoger"},
+    )
+    assert missing_address.status_code == 400
+    assert "dirección privada" in missing_address.get_json()["error"]
+
+    producer.farm_address = "Finca El Paraíso, vía Montería"
+    db.session.commit()
+    ready = client.patch(
+        f"/api/quotations/{quotation.id}",
+        json={"status": "Listo para recoger"},
+    )
+    assert ready.status_code == 200
+    assert ready.get_json()["quotation"]["producerPickupAddress"] == "Finca El Paraíso, vía Montería"
+
+    buyer_client = flask_app.test_client()
+    login_as(buyer_client, buyer)
+    closed = buyer_client.patch(
+        f"/api/quotations/{quotation.id}",
+        json={"status": "Cerrado"},
+    )
+    assert closed.status_code == 200
+
+
+def test_domicile_quotation_requires_address_and_complete_coordinates(client):
+    buyer = create_user(
+        google_sub="delivery-validation-buyer",
+        email="delivery-validation-buyer@example.com",
+        role="cliente",
+    )
+    producer = create_user(
+        google_sub="delivery-validation-producer",
+        email="delivery-validation-producer@example.com",
+        role="productor",
+        status="activo",
+    )
+    listing = create_listing(producer)
+    login_as(client, buyer)
+    payload = {
+        "productId": listing.id,
+        "quantityKg": 100,
+        "destinationZone": "Local Córdoba",
+        "freightCop": 0,
+        "fulfillmentMethod": "domicilio",
+        "paymentMethod": "transferencia",
+    }
+
+    missing_address = client.post("/api/quotations", json=payload)
+    assert missing_address.status_code == 400
+
+    payload.update({
+        "deliveryAddress": "Carrera 1 # 2-3, Montería",
+        "deliveryLatitude": 8.75,
+    })
+    incomplete_coordinates = client.post("/api/quotations", json=payload)
+    assert incomplete_coordinates.status_code == 400
+
+    payload["deliveryLongitude"] = -75.88
+    created = client.post("/api/quotations", json=payload)
+    assert created.status_code == 201
+    quotation = created.get_json()["quotation"]
+    assert quotation["fulfillmentMethod"] == "domicilio"
+    assert quotation["paymentMethod"] == "transferencia"
+    assert "deliveryAddress" not in quotation
+
+
+def test_unread_message_counts_are_per_quotation_and_clear_when_chat_opens(client):
+    buyer = create_user(
+        google_sub="unread-buyer",
+        email="unread-buyer@example.com",
+    )
+    producer = create_user(
+        google_sub="unread-producer",
+        email="unread-producer@example.com",
+        role="productor",
+        status="activo",
+    )
+    quotation = create_quotation(buyer.id, producer.id)
+    db.session.add_all([
+        QuotationMessage(
+            quotation_id=quotation.id,
+            sender_id=producer.id,
+            sender_name=producer.name,
+            content="¿Cuándo lo necesitas?",
+        ),
+        QuotationMessage(
+            quotation_id=quotation.id,
+            sender_id=buyer.id,
+            sender_name=buyer.name,
+            content="Esta semana.",
+        ),
+    ])
+    db.session.commit()
+    login_as(client, buyer)
+
+    counts = client.get("/api/notifications/unread-messages")
+    assert counts.status_code == 200
+    assert counts.get_json()["counts"] == {quotation.id: 1}
+
+    socket = socketio.test_client(flask_app, flask_test_client=client)
+    result = socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)
+    assert result["ok"] is True
+    assert client.get("/api/notifications/unread-messages").get_json()["counts"] == {}
+
+
+def test_product_public_data_uses_local_image_fallbacks_when_missing(client):
+    producer = create_user(
+        google_sub="producer-without-profile-image",
+        email="producer-without-image@example.com",
+        role="productor",
+        avatar="",
+    )
+    listing = create_listing(
+        producer,
+        product_payload(name="Yuca de ejemplo", image=""),
+    )
+
+    public_product = listing.to_public_dict()
+
+    assert public_product["image"] == "/images/yuca-real.jpg"
+    assert public_product["producerPhoto"] == "/images/campesinos-colombia.jpg"
 
 
 def test_product_validation_accepts_cordoba_negative_longitude():
@@ -459,6 +691,927 @@ def test_quotation_fields_are_relational_and_survive_product_deletion(client):
     assert client.get("/api/quotations").get_json()["quotations"][0]["productName"] == "Yuca"
 
 
+def test_price_reference_uses_the_latest_official_dane_sipsa_report(client, monkeypatch):
+    rows = [
+        {
+            "productName": "Yuca",
+            "market": "Montería, Mercado del Sur",
+            "city": "Montería",
+            "meanPriceCop": 2600,
+            "date": "2026-10-30",
+        },
+        {
+            "productName": "Yuca",
+            "market": "Sincelejo, Nuevo Mercado",
+            "city": "Sincelejo",
+            "meanPriceCop": 2438,
+            "date": "2026-10-30",
+        },
+    ]
+    monkeypatch.setattr(
+        app_module,
+        "_get_sipsa_price_references",
+        lambda product: (rows, "2026-10-30", "https://www.dane.gov.co/files/operaciones/SIPSA/anex-SIPSADiario-30oct2026.xlsx"),
+    )
+
+    response = client.get("/api/price-references?product=Yuca%20de%20ejemplo")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert [item["market"] for item in payload["references"]] == [
+        "Montería, Mercado del Sur",
+        "Sincelejo, Nuevo Mercado",
+    ]
+    assert payload["references"][0]["meanPriceCop"] == 2600
+    assert payload["reportDate"] == "2026-10-30"
+    assert payload["reportUrl"].endswith("anex-SIPSADiario-30oct2026.xlsx")
+    assert payload["source"]["unit"] == "COP/kg"
+    assert "SIPSA" in payload["source"]["name"]
+
+
+def test_price_reference_rejects_missing_product(client):
+    response = client.get("/api/price-references")
+
+    assert response.status_code == 400
+    assert "producto válido" in response.get_json()["error"]
+
+
+def test_price_reference_reports_upstream_errors(client, monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise app_module.requests.Timeout("source timeout")
+
+    monkeypatch.setattr(app_module, "_get_sipsa_price_references", unavailable)
+
+    response = client.get("/api/price-references?product=Yuca")
+
+    assert response.status_code == 502
+    assert "DANE" in response.get_json()["error"]
+
+
+def test_price_reference_uses_the_last_saved_report_when_dane_is_unavailable(client, monkeypatch):
+    db.session.add(
+        SipsaPriceReference(
+            product_key="yuca",
+            product_name="Yuca",
+            market="Montería, Mercado del Sur",
+            price_cop_kg=2600,
+            report_date=datetime(2026, 10, 30).date(),
+            report_url="https://www.dane.gov.co/sipsa-30oct2026.xlsx",
+        )
+    )
+    db.session.commit()
+
+    def unavailable(*args, **kwargs):
+        raise app_module.requests.Timeout("source timeout")
+
+    monkeypatch.setattr(app_module, "_get_sipsa_price_references", unavailable)
+    response = client.get("/api/price-references?product=Yuca%20de%20ejemplo")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["fallbackToStoredData"] is True
+    assert payload["reportDate"] == "2026-10-30"
+    assert payload["references"][0]["meanPriceCop"] == 2600
+
+
+def test_price_reference_batch_persists_and_returns_each_product(client, monkeypatch):
+    rows = [
+        {
+            "productName": "Yuca",
+            "market": "Montería, Mercado del Sur",
+            "priceCopKg": 2600,
+            "date": "2026-10-30",
+        },
+        {
+            "productName": "Mango",
+            "market": "Montería, Mercado del Sur",
+            "priceCopKg": 5200,
+            "date": "2026-10-30",
+        },
+    ]
+    monkeypatch.setattr(
+        app_module,
+        "_get_latest_sipsa_rows",
+        lambda: (
+            rows,
+            "2026-10-30",
+            "https://www.dane.gov.co/sipsa-30oct2026.xlsx",
+        ),
+    )
+
+    response = client.get(
+        "/api/price-references/batch?product=Yuca%20de%20ejemplo&product=Mango"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()["referencesByProduct"]
+    assert payload["Yuca de ejemplo"]["references"][0]["meanPriceCop"] == 2600
+    assert payload["Mango"]["references"][0]["meanPriceCop"] == 5200
+    assert SipsaPriceReference.query.count() == 2
+
+
+def test_sipsa_reference_lookup_returns_live_metadata_and_persists_rows(client, monkeypatch):
+    rows = [
+        {
+            "productName": "Yuca",
+            "market": "Montería, Mercado del Sur",
+            "priceCopKg": 2600,
+            "date": "2026-10-30",
+        }
+    ]
+    report_url = "https://www.dane.gov.co/sipsa-30oct2026.xlsx"
+    monkeypatch.setattr(
+        app_module,
+        "_get_latest_sipsa_rows",
+        lambda: (rows, "2026-10-30", report_url),
+    )
+
+    references, report_date, actual_report_url = app_module._get_sipsa_price_references(
+        "Yuca de ejemplo"
+    )
+
+    assert references[0]["meanPriceCop"] == 2600
+    assert report_date == "2026-10-30"
+    assert actual_report_url == report_url
+    assert SipsaPriceReference.query.count() == 1
+
+
+def test_scheduled_sipsa_refresh_requires_token_and_upserts_daily_data(client, monkeypatch):
+    monkeypatch.setenv("SIPSA_TASK_TOKEN", "test-refresh-token")
+    report = [
+        {
+            "productName": "Yuca",
+            "market": "Montería, Mercado del Sur",
+            "priceCopKg": 2600,
+            "date": "2026-10-30",
+        }
+    ]
+    monkeypatch.setattr(
+        app_module,
+        "_fetch_latest_sipsa_report",
+        lambda: (
+            report,
+            "2026-10-30",
+            "https://www.dane.gov.co/sipsa-30oct2026.xlsx",
+        ),
+    )
+
+    denied = client.post("/api/tasks/price-references/refresh")
+    assert denied.status_code == 403
+
+    headers = {"Authorization": "Bearer test-refresh-token"}
+    first = client.post("/api/tasks/price-references/refresh", headers=headers)
+    assert first.status_code == 200
+    assert first.get_json()["storedRows"] == 1
+
+    report[0]["priceCopKg"] = 2750
+    second = client.post("/api/tasks/price-references/refresh", headers=headers)
+
+    assert second.status_code == 200
+    assert SipsaPriceReference.query.count() == 1
+    assert SipsaPriceReference.query.one().price_cop_kg == 2750
+
+
+def test_sipsa_parser_selects_latest_report_and_reads_market_prices(monkeypatch):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Boletín diario"
+    sheet["A2"] = "Precios mayoristas del 30 de octubre de 2026"
+    for row, values in {
+        3: ["Producto", "Montería, Mercado del Sur", "Variación", "Sincelejo, Nuevo Mercado", "Variación"],
+        4: ["", "Precio $/Kg", "Variación %", "Precio $/Kg", "Variación %"],
+        5: ["Yuca*", 2600, 1.2, 2438, -0.5],
+    }.items():
+        for column, value in enumerate(values, start=1):
+            sheet.cell(row=row, column=column, value=value)
+    content = BytesIO()
+    workbook.save(content)
+    content.seek(0)
+
+    responses = [
+        type("Response", (), {"text": (
+            '<a href="/files/operaciones/SIPSA/anex-SIPSADiario-29oct2026.xlsx">'
+            '<a href="/files/operaciones/SIPSA/anex-SIPSADiario-30oct2026.xlsx">'
+        ), "raise_for_status": lambda self: None})(),
+        type("Response", (), {"content": content.getvalue(), "raise_for_status": lambda self: None})(),
+    ]
+    monkeypatch.setattr(app_module.requests, "get", lambda *args, **kwargs: responses.pop(0))
+
+    rows, report_date, report_url = app_module._fetch_latest_sipsa_report()
+
+    assert report_date == "2026-10-30"
+    assert report_url.endswith("anex-SIPSADiario-30oct2026.xlsx")
+    assert [(row["productName"], row["market"], row["priceCopKg"]) for row in rows] == [
+        ("Yuca", "Montería, Mercado del Sur", 2600),
+        ("Yuca", "Sincelejo, Nuevo Mercado", 2438),
+    ]
+
+
+def test_quotation_socket_requires_authentication(client):
+    socket = socketio.test_client(flask_app, flask_test_client=client)
+
+    assert not socket.is_connected()
+
+
+def test_quotation_messages_are_realtime_persistent_and_scoped_to_participants(client):
+    buyer = create_user(google_sub="chat-buyer", email="chat-buyer@example.com")
+    producer = create_user(
+        google_sub="chat-producer",
+        email="chat-producer@example.com",
+        role="productor",
+        status="activo",
+    )
+    quotation = create_quotation(buyer.id, producer.id)
+    db.session.commit()
+
+    buyer_http = flask_app.test_client()
+    login_as(buyer_http, buyer)
+    buyer_socket = socketio.test_client(flask_app, flask_test_client=buyer_http)
+    assert buyer_socket.is_connected()
+    buyer_join = buyer_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)
+    assert buyer_join["ok"] is True
+    assert buyer_join["messages"] == []
+
+    producer_http = flask_app.test_client()
+    login_as(producer_http, producer)
+    manual_agreement = producer_http.patch(
+        f"/api/quotations/{quotation.id}",
+        json={"status": "Acordado"},
+    )
+    assert manual_agreement.status_code == 400
+    producer_socket = socketio.test_client(flask_app, flask_test_client=producer_http)
+    assert producer_socket.is_connected()
+    producer_join = producer_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)
+    assert producer_join["ok"] is True
+
+    sent = buyer_socket.emit(
+        "quotation:send",
+        {"quotationId": quotation.id, "content": "¿Podemos acordar la entrega para el viernes?"},
+        callback=True,
+    )
+    assert sent["ok"] is True
+    assert sent["message"]["senderId"] == buyer.id
+    assert any(
+        event["name"] == "quotation:message" and event["args"][0]["content"] == sent["message"]["content"]
+        for event in producer_socket.get_received()
+    )
+    assert QuotationMessage.query.filter_by(quotation_id=quotation.id).count() == 1
+
+    buyer_socket.disconnect()
+    producer_socket.disconnect()
+
+
+def test_quotation_socket_presence_typing_and_read_receipts(client):
+    buyer = create_user(google_sub="presence-buyer", email="presence-buyer@example.com")
+    producer = create_user(
+        google_sub="presence-producer",
+        email="presence-producer@example.com",
+        role="productor",
+        status="activo",
+    )
+    outsider = create_user(google_sub="presence-outsider", email="presence-outsider@example.com")
+    quotation = create_quotation(buyer.id, producer.id)
+    db.session.commit()
+
+    buyer_http = flask_app.test_client()
+    login_as(buyer_http, buyer)
+    buyer_socket = socketio.test_client(flask_app, flask_test_client=buyer_http)
+    buyer_join = buyer_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)
+    assert buyer_join["ok"] is True
+    assert buyer_join["participantOnline"] is False
+
+    sent = buyer_socket.emit(
+        "quotation:send",
+        {"quotationId": quotation.id, "content": "Quedo atento a la disponibilidad."},
+        callback=True,
+    )
+    assert sent["ok"] is True
+    assert sent["message"]["readAt"] is None
+
+    producer_http = flask_app.test_client()
+    login_as(producer_http, producer)
+    producer_socket = socketio.test_client(flask_app, flask_test_client=producer_http)
+    producer_join = producer_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)
+    assert producer_join["ok"] is True
+    assert producer_join["participantOnline"] is True
+    assert producer_join["messages"][0]["readAt"] is not None
+    assert any(
+        event["name"] == "quotation:read"
+        and sent["message"]["id"] in event["args"][0]["messageIds"]
+        for event in buyer_socket.get_received()
+    )
+
+    read_on_delivery = producer_socket.emit(
+        "quotation:send",
+        {"quotationId": quotation.id, "content": "Sí, hay disponibilidad para el viernes."},
+        callback=True,
+    )
+    assert read_on_delivery["ok"] is True
+    assert read_on_delivery["message"]["readAt"] is not None
+
+    typing = buyer_socket.emit(
+        "quotation:typing",
+        {"quotationId": quotation.id, "typing": True},
+        callback=True,
+    )
+    assert typing["ok"] is True
+    assert any(
+        event["name"] == "quotation:typing"
+        and event["args"][0] == {"userId": buyer.id, "typing": True}
+        for event in producer_socket.get_received()
+    )
+
+    outsider_http = flask_app.test_client()
+    login_as(outsider_http, outsider)
+    outsider_socket = socketio.test_client(flask_app, flask_test_client=outsider_http)
+    denied_typing = outsider_socket.emit(
+        "quotation:typing",
+        {"quotationId": quotation.id, "typing": True},
+        callback=True,
+    )
+    assert denied_typing["ok"] is False
+
+    producer_socket.disconnect()
+    assert any(
+        event["name"] == "quotation:presence"
+        and event["args"][0] == {"userId": producer.id, "online": False}
+        for event in buyer_socket.get_received()
+    )
+
+    outsider_socket.disconnect()
+    buyer_socket.disconnect()
+
+
+def test_quotation_socket_denies_nonparticipants_and_invalid_messages(client):
+    buyer = create_user(google_sub="chat-owner", email="chat-owner@example.com")
+    producer = create_user(
+        google_sub="chat-owner-producer",
+        email="chat-owner-producer@example.com",
+        role="productor",
+        status="activo",
+    )
+    other_buyer = create_user(google_sub="chat-other", email="chat-other@example.com")
+    quotation = create_quotation(buyer.id, producer.id)
+    db.session.commit()
+
+    other_http = flask_app.test_client()
+    login_as(other_http, other_buyer)
+    other_socket = socketio.test_client(flask_app, flask_test_client=other_http)
+    denied_join = other_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)
+    denied_send = other_socket.emit(
+        "quotation:send",
+        {"quotationId": quotation.id, "content": "No autorizado"},
+        callback=True,
+    )
+    assert denied_join["ok"] is False
+    assert denied_send["ok"] is False
+
+    buyer_http = flask_app.test_client()
+    login_as(buyer_http, buyer)
+    buyer_socket = socketio.test_client(flask_app, flask_test_client=buyer_http)
+    invalid_send = buyer_socket.emit(
+        "quotation:send",
+        {"quotationId": quotation.id, "content": " "},
+        callback=True,
+    )
+    assert invalid_send["ok"] is False
+    assert QuotationMessage.query.count() == 0
+
+    other_socket.disconnect()
+    buyer_socket.disconnect()
+
+
+def test_quotation_offers_are_structured_counteroffers_and_update_quote_state(client, monkeypatch):
+    buyer = create_user(google_sub="offer-buyer", email="offer-buyer@example.com")
+    producer = create_user(
+        google_sub="offer-producer",
+        email="offer-producer@example.com",
+        role="productor",
+        status="activo",
+    )
+    quotation = create_quotation(buyer.id, producer.id)
+    db.session.commit()
+    price_reference = {
+        "productName": "Yuca",
+        "market": "Montería, Mercado del Sur",
+        "city": "Montería",
+        "meanPriceCop": 2600,
+        "date": "2026-10-30",
+    }
+    monkeypatch.setattr(
+        app_module,
+        "_official_price_snapshot",
+        lambda product: (
+            price_reference,
+            "2026-10-30",
+            "https://www.dane.gov.co/files/operaciones/SIPSA/anex-SIPSADiario-30oct2026.xlsx",
+        ),
+    )
+
+    buyer_http = flask_app.test_client()
+    login_as(buyer_http, buyer)
+    buyer_socket = socketio.test_client(flask_app, flask_test_client=buyer_http)
+    assert buyer_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)["ok"]
+
+    producer_http = flask_app.test_client()
+    login_as(producer_http, producer)
+    producer_socket = socketio.test_client(flask_app, flask_test_client=producer_http)
+    assert producer_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)["ok"]
+
+    producer_offer = producer_socket.emit(
+        "quotation:offer",
+        {"quotationId": quotation.id, "unitPriceCop": 2800, "quantityKg": 50, "freightCop": 5000},
+        callback=True,
+    )
+    assert producer_offer["ok"] is True
+    assert producer_offer["quotation"]["status"] == "Cotizado"
+    assert producer_offer["message"]["messageType"] == "offer"
+    assert producer_offer["message"]["offer"]["totalCop"] == 145000
+    assert producer_offer["message"]["offer"]["priceReference"]["market"] == "Montería, Mercado del Sur"
+    assert producer_offer["message"]["offer"]["priceReference"]["priceCopKg"] == 2600
+
+    duplicate_offer = producer_socket.emit(
+        "quotation:offer",
+        {"quotationId": quotation.id, "unitPriceCop": 2850, "quantityKg": 50, "freightCop": 5000},
+        callback=True,
+    )
+    assert duplicate_offer["ok"] is False
+
+    counteroffer = buyer_socket.emit(
+        "quotation:offer",
+        {"quotationId": quotation.id, "unitPriceCop": 2700, "quantityKg": 60, "freightCop": 0},
+        callback=True,
+    )
+    assert counteroffer["ok"] is True
+    assert counteroffer["quotation"]["status"] == "En negociación"
+    first_offer = db.session.get(QuotationOffer, producer_offer["message"]["offer"]["id"])
+    second_offer = db.session.get(QuotationOffer, counteroffer["message"]["offer"]["id"])
+    assert first_offer.status == "Contraofertada"
+    assert second_offer.status == "Pendiente"
+    assert any(
+        event["name"] == "quotation:offer:updated"
+        and event["args"][0]["offer"]["status"] == "Contraofertada"
+        for event in buyer_socket.get_received()
+    )
+
+    competing_offer = QuotationOffer(
+        quotation_id=quotation.id,
+        sender_id=producer.id,
+        sender_name=producer.name,
+        unit_price_cop=3000,
+        quantity_kg=40,
+        freight_cop=1000,
+        total_cop=121000,
+        reference_product="Yuca",
+        reference_price_cop_kg=2600,
+        reference_market="Montería, Mercado del Sur",
+        reference_date="2026-10-30",
+        reference_source_url="https://www.dane.gov.co",
+    )
+    db.session.add(competing_offer)
+    db.session.flush()
+    db.session.add(
+        QuotationMessage(
+            quotation_id=quotation.id,
+            sender_id=producer.id,
+            sender_name=producer.name,
+            content="Oferta alternativa",
+            message_type="offer",
+            offer_id=competing_offer.id,
+        )
+    )
+    db.session.commit()
+
+    accepted = producer_socket.emit(
+        "quotation:offer:respond",
+        {"offerId": second_offer.id, "action": "accept"},
+        callback=True,
+    )
+    assert accepted["ok"] is True
+    assert accepted["offer"]["status"] == "Aceptada"
+    assert accepted["quotation"]["status"] == "Acordado"
+    agreed_quotation = db.session.get(QuotationRecord, quotation.id)
+    assert agreed_quotation.status == "Acordado"
+    assert agreed_quotation.quantity_kg == 60
+    assert agreed_quotation.subtotal_cop == 162000
+    assert agreed_quotation.freight_cop == 0
+    assert agreed_quotation.total_cop == 162000
+    assert db.session.get(QuotationOffer, competing_offer.id).status == "Anulada"
+    assert any(
+        event["name"] == "quotation:offer:updated"
+        for event in buyer_socket.get_received()
+    )
+
+    buyer_socket.disconnect()
+    producer_socket.disconnect()
+
+
+def test_quotation_socket_reconnect_reloads_persisted_messages_without_duplicates(client):
+    buyer = create_user(
+        google_sub="reconnect-buyer",
+        email="reconnect-buyer@example.com",
+    )
+    producer = create_user(
+        google_sub="reconnect-producer",
+        email="reconnect-producer@example.com",
+        role="productor",
+    )
+    quotation = create_quotation(buyer.id, producer.id)
+
+    first_http = flask_app.test_client()
+    login_as(first_http, buyer)
+    first_socket = socketio.test_client(flask_app, flask_test_client=first_http)
+    assert first_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)["ok"]
+    sent = first_socket.emit(
+        "quotation:send",
+        {"quotationId": quotation.id, "content": "Mensaje antes de reconectar."},
+        callback=True,
+    )
+    assert sent["ok"] is True
+    first_socket.disconnect()
+
+    second_http = flask_app.test_client()
+    login_as(second_http, buyer)
+    second_socket = socketio.test_client(flask_app, flask_test_client=second_http)
+    rejoined = second_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)
+
+    assert rejoined["ok"] is True
+    assert [message["id"] for message in rejoined["messages"]] == [sent["message"]["id"]]
+    assert QuotationMessage.query.filter_by(quotation_id=quotation.id).count() == 1
+    second_socket.disconnect()
+
+
+def test_quotation_offer_can_be_sent_without_official_reference(client, monkeypatch):
+    buyer = create_user(google_sub="offer-check-buyer", email="offer-check-buyer@example.com")
+    producer = create_user(
+        google_sub="offer-check-producer",
+        email="offer-check-producer@example.com",
+        role="productor",
+        status="activo",
+    )
+    quotation = create_quotation(buyer.id, producer.id)
+    db.session.commit()
+    buyer_http = flask_app.test_client()
+    login_as(buyer_http, buyer)
+    buyer_socket = socketio.test_client(flask_app, flask_test_client=buyer_http)
+    buyer_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)
+
+    monkeypatch.setattr(app_module, "_official_price_snapshot", lambda product: (None, "2026-10-30", ""))
+    no_reference = buyer_socket.emit(
+        "quotation:offer",
+        {"quotationId": quotation.id, "unitPriceCop": 2500, "quantityKg": 50, "freightCop": 0},
+        callback=True,
+    )
+    assert no_reference["ok"] is True
+    assert no_reference["message"]["offer"]["priceReference"] is None
+    assert "no tiene un precio comparable" in no_reference["message"]["offer"]["priceReferenceUnavailable"]["reason"]
+    assert no_reference["message"]["offer"]["priceReferenceUnavailable"]["date"] == "2026-10-30"
+    assert QuotationOffer.query.count() == 1
+    saved_offer = QuotationOffer.query.one()
+    assert saved_offer.reference_price_cop_kg == 0
+    assert saved_offer.reference_source_url == app_module.DANE_SIPSA_PAGE_URL
+
+    monkeypatch.setattr(
+        app_module,
+        "_official_price_snapshot",
+        lambda product: (
+            {
+                "productName": "Yuca",
+                "market": "Montería, Mercado del Sur",
+                "meanPriceCop": 2600,
+                "date": "2026-10-30",
+            },
+            "2026-10-30",
+            "https://www.dane.gov.co/sipsa.xlsx",
+        ),
+    )
+    producer_http = flask_app.test_client()
+    login_as(producer_http, producer)
+    producer_socket = socketio.test_client(flask_app, flask_test_client=producer_http)
+    assert producer_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)["ok"]
+    rejected = producer_socket.emit(
+        "quotation:offer:respond",
+        {"offerId": saved_offer.id, "action": "reject"},
+        callback=True,
+    )
+    assert rejected["ok"] is True
+
+    invalid = buyer_socket.emit(
+        "quotation:offer",
+        {"quotationId": quotation.id, "unitPriceCop": -1, "quantityKg": 50, "freightCop": 0},
+        callback=True,
+    )
+    assert invalid["ok"] is False
+    assert QuotationOffer.query.count() == 1
+    buyer_socket.disconnect()
+    producer_socket.disconnect()
+
+
+def test_quotation_offer_can_be_sent_when_official_source_is_unavailable(client, monkeypatch):
+    buyer = create_user(google_sub="offer-source-down-buyer", email="offer-source-down-buyer@example.com")
+    producer = create_user(
+        google_sub="offer-source-down-producer",
+        email="offer-source-down-producer@example.com",
+        role="productor",
+        status="activo",
+    )
+    quotation = create_quotation(buyer.id, producer.id)
+    db.session.commit()
+    buyer_http = flask_app.test_client()
+    login_as(buyer_http, buyer)
+    buyer_socket = socketio.test_client(flask_app, flask_test_client=buyer_http)
+    assert buyer_socket.emit("quotation:join", {"quotationId": quotation.id}, callback=True)["ok"]
+
+    def unavailable(product):
+        raise app_module.requests.Timeout("source timeout")
+
+    monkeypatch.setattr(app_module, "_official_price_snapshot", unavailable)
+    sent = buyer_socket.emit(
+        "quotation:offer",
+        {"quotationId": quotation.id, "unitPriceCop": 2500, "quantityKg": 50, "freightCop": 0},
+        callback=True,
+    )
+
+    assert sent["ok"] is True
+    assert sent["message"]["offer"]["priceReference"] is None
+    assert "No se pudo consultar" in sent["message"]["offer"]["priceReferenceUnavailable"]["reason"]
+    assert sent["message"]["offer"]["priceReferenceUnavailable"]["sourceUrl"] == app_module.DANE_SIPSA_PAGE_URL
+    assert QuotationOffer.query.count() == 1
+    buyer_socket.disconnect()
+
+
+def test_admin_account_deletion_removes_associated_quotation_messages(client):
+    buyer = create_user(google_sub="chat-delete-buyer", email="chat-delete-buyer@example.com")
+    producer = create_user(
+        google_sub="chat-delete-producer",
+        email="chat-delete-producer@example.com",
+        role="productor",
+        status="activo",
+    )
+    admin = create_user(
+        google_sub="chat-delete-admin",
+        email="chat-delete-admin@example.com",
+        role="admin",
+    )
+    quotation = create_quotation(buyer.id, producer.id)
+    offer = QuotationOffer(
+        quotation_id=quotation.id,
+        sender_id=producer.id,
+        sender_name=producer.name,
+        unit_price_cop=2500,
+        quantity_kg=10,
+        freight_cop=0,
+        total_cop=25000,
+        reference_product="Yuca",
+        reference_price_cop_kg=2600,
+        reference_market="Montería, Mercado del Sur",
+        reference_date="2026-10-30",
+        reference_source_url="https://www.dane.gov.co/sipsa.xlsx",
+    )
+    db.session.add(offer)
+    db.session.flush()
+    db.session.add(
+        QuotationMessage(
+            quotation_id=quotation.id,
+            sender_id=buyer.id,
+            sender_name=buyer.name,
+            content="Mensaje de prueba",
+            message_type="offer",
+            offer_id=offer.id,
+        )
+    )
+    db.session.commit()
+    quotation_id = quotation.id
+    login_as(client, admin)
+
+    response = client.delete(f"/api/admin/users/{buyer.id}")
+
+    assert response.status_code == 200
+    assert QuotationRecord.query.filter_by(id=quotation_id).first() is None
+    assert QuotationMessage.query.count() == 0
+    assert QuotationOffer.query.count() == 0
+
+
+def test_user_can_delete_own_account_and_related_data(client):
+    from werkzeug.security import generate_password_hash
+
+    producer = create_user(
+        google_sub="producer-for-account-deletion",
+        email="producer-for-deletion@example.com",
+        role="productor",
+    )
+    buyer = create_user(
+        google_sub="local:buyer-for-account-deletion",
+        email="buyer-for-deletion@example.com",
+        role="cliente",
+        password_hash=generate_password_hash("current-password"),
+    )
+    listing = create_listing(producer)
+    listing.certifications.append(ProductCertification(name="Certificación de prueba"))
+    quotation = create_quotation(
+        buyer.id,
+        producer.id,
+        listing.id,
+        product_listing_id=listing.id,
+        status="Acordado",
+    )
+    offer = QuotationOffer(
+        quotation_id=quotation.id,
+        sender_id=producer.id,
+        sender_name=producer.name,
+        unit_price_cop=2500,
+        quantity_kg=10,
+        freight_cop=0,
+        total_cop=25000,
+        reference_product="Yuca",
+        reference_price_cop_kg=2600,
+        reference_market="Montería",
+        reference_date="2026-10-30",
+        reference_source_url="https://www.dane.gov.co/sipsa.xlsx",
+    )
+    db.session.add_all([
+        offer,
+        Favorite(user_id=buyer.id, product_id=listing.id),
+        ReadNotification(user_id=buyer.id, quotation_id=quotation.id),
+        AccountSettings(user_id=buyer.id),
+        SettingsVerification(
+            user_id=buyer.id,
+            code_hash="verification-hash",
+            expires_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            sent_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        ),
+        PasswordResetVerification(
+            user_id=buyer.id,
+            code_hash="reset-hash",
+            expires_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            sent_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        ),
+    ])
+    db.session.flush()
+    db.session.add(
+        QuotationMessage(
+            quotation_id=quotation.id,
+            sender_id=buyer.id,
+            sender_name=buyer.name,
+            content="Mensaje de prueba",
+            message_type="offer",
+            offer_id=offer.id,
+        )
+    )
+    db.session.commit()
+    quotation_id = quotation.id
+    buyer_id = buyer.id
+    login_as(client, buyer)
+
+    invalid_email = client.delete(
+        "/api/account",
+        json={
+            "email": "other@example.com",
+            "confirmation": "ELIMINAR MI CUENTA",
+            "currentPassword": "current-password",
+        },
+    )
+    assert invalid_email.status_code == 400
+
+    invalid_confirmation = client.delete(
+        "/api/account",
+        json={
+            "email": buyer.email,
+            "confirmation": "ELIMINAR",
+            "currentPassword": "current-password",
+        },
+    )
+    assert invalid_confirmation.status_code == 400
+
+    invalid_password = client.delete(
+        "/api/account",
+        json={
+            "email": buyer.email,
+            "confirmation": "ELIMINAR MI CUENTA",
+            "currentPassword": "incorrect-password",
+        },
+    )
+    assert invalid_password.status_code == 400
+    assert User.query.filter_by(id=buyer_id).first() is not None
+    assert QuotationRecord.query.filter_by(id=quotation_id).first() is not None
+
+    response = client.delete(
+        "/api/account",
+        json={
+            "email": buyer.email,
+            "confirmation": "ELIMINAR MI CUENTA",
+            "currentPassword": "current-password",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True}
+    assert User.query.filter_by(id=buyer_id).first() is None
+    assert QuotationRecord.query.filter_by(id=quotation_id).first() is None
+    assert QuotationOffer.query.filter_by(quotation_id=quotation_id).first() is None
+    assert QuotationMessage.query.filter_by(quotation_id=quotation_id).first() is None
+    assert Favorite.query.filter_by(user_id=buyer_id).first() is None
+    assert ReadNotification.query.filter_by(user_id=buyer_id).first() is None
+    assert AccountSettings.query.filter_by(user_id=buyer_id).first() is None
+    assert SettingsVerification.query.filter_by(user_id=buyer_id).first() is None
+    assert PasswordResetVerification.query.filter_by(user_id=buyer_id).first() is None
+
+
+def test_google_user_can_delete_own_account_after_explicit_confirmation(client):
+    user = create_user(
+        google_sub="google-account-for-deletion",
+        email="google-user-for-deletion@example.com",
+        role="cliente",
+        password_hash=None,
+    )
+    login_as(client, user)
+
+    response = client.delete(
+        "/api/account",
+        json={"email": user.email, "confirmation": "ELIMINAR MI CUENTA"},
+    )
+
+    assert response.status_code == 200
+    assert User.query.filter_by(id=user.id).first() is None
+    assert client.get("/api/auth/me").status_code == 401
+
+
+def test_producer_can_delete_own_account_and_listings(client):
+    from werkzeug.security import generate_password_hash
+
+    producer = create_user(
+        google_sub="local:producer-for-account-deletion",
+        email="producer-own-deletion@example.com",
+        role="productor",
+        password_hash=generate_password_hash("producer-password"),
+    )
+    buyer = create_user(
+        google_sub="buyer-for-producer-deletion",
+        email="buyer-for-producer-deletion@example.com",
+    )
+    listing = create_listing(producer)
+    listing.certifications.append(ProductCertification(name="Certificación de prueba"))
+    quotation = create_quotation(
+        buyer.id,
+        producer.id,
+        listing.id,
+        product_listing_id=listing.id,
+    )
+    db.session.add(ProducerProduct(user_id=producer.id, name="Yuca"))
+    db.session.commit()
+    producer_id = producer.id
+    listing_id = listing.id
+    quotation_id = quotation.id
+    login_as(client, producer)
+
+    response = client.delete(
+        "/api/account",
+        json={
+            "email": producer.email,
+            "confirmation": "ELIMINAR MI CUENTA",
+            "currentPassword": "producer-password",
+        },
+    )
+
+    assert response.status_code == 200
+    assert User.query.filter_by(id=producer_id).first() is None
+    assert User.query.filter_by(id=buyer.id).first() is not None
+    assert ProductListing.query.filter_by(id=listing_id).first() is None
+    assert ProductCertification.query.filter_by(product_id=listing_id).first() is None
+    assert ProducerProduct.query.filter_by(user_id=producer_id).first() is None
+    assert QuotationRecord.query.filter_by(id=quotation_id).first() is None
+
+
+def test_admin_cannot_delete_account_through_self_service_endpoint(client):
+    from werkzeug.security import generate_password_hash
+
+    admin = create_user(
+        google_sub="local:admin-account-deletion",
+        email="admin-account-deletion@example.com",
+        role="admin",
+        password_hash=generate_password_hash("admin-password"),
+    )
+    login_as(client, admin)
+
+    response = client.delete(
+        "/api/account",
+        json={
+            "email": admin.email,
+            "confirmation": "ELIMINAR MI CUENTA",
+            "currentPassword": "admin-password",
+        },
+    )
+
+    assert response.status_code == 403
+    assert User.query.filter_by(id=admin.id).first() is not None
+
+
+def test_account_deletion_requires_authentication(client):
+    response = client.delete("/api/account", json={})
+
+    assert response.status_code == 401
+
+
 def test_legacy_json_columns_are_migrated_without_losing_values(client):
     producer = create_user(
         google_sub="legacy-producer",
@@ -562,6 +1715,36 @@ def test_legacy_json_columns_are_migrated_without_losing_values(client):
     )
 
 
+def test_normalized_table_migration_adds_delivery_and_private_address_columns(client):
+    for table, column in (
+        ("user", "farm_address"),
+        ("quotation_record", "fulfillment_method"),
+        ("quotation_record", "delivery_address"),
+        ("quotation_record", "delivery_latitude"),
+        ("quotation_record", "delivery_longitude"),
+        ("quotation_record", "payment_method"),
+    ):
+        db.session.execute(text(f'ALTER TABLE "{table}" DROP COLUMN "{column}"'))
+    db.session.commit()
+
+    _migrate_user_columns()
+    _migrate_normalized_tables()
+
+    assert "farm_address" in {
+        column["name"] for column in inspect(db.engine).get_columns("user")
+    }
+    quotation_columns = {
+        column["name"] for column in inspect(db.engine).get_columns("quotation_record")
+    }
+    assert {
+        "fulfillment_method",
+        "delivery_address",
+        "delivery_latitude",
+        "delivery_longitude",
+        "payment_method",
+    } <= quotation_columns
+
+
 def test_profile_photo_is_persisted_and_rejects_invalid_data(client):
     user = create_user(google_sub="profile-user", email="profile@example.com")
     login_as(client, user)
@@ -642,6 +1825,67 @@ def test_password_recovery_verifies_code_and_changes_password(client, monkeypatc
     assert check_password_hash(db.session.get(User, user.id).password_hash, "new-password-456")
 
 
+def test_authenticated_account_can_change_local_password(client):
+    from werkzeug.security import check_password_hash, generate_password_hash
+
+    user = create_user(
+        google_sub="change-password-user",
+        email="change-password@example.com",
+        password_hash=generate_password_hash("current-password-123"),
+    )
+    login_as(client, user)
+
+    wrong_current_password = client.patch(
+        "/api/account/password",
+        json={"currentPassword": "incorrect-password", "newPassword": "new-password-456"},
+    )
+    assert wrong_current_password.status_code == 400
+    assert not check_password_hash(db.session.get(User, user.id).password_hash, "new-password-456")
+
+    invalid_new_password = client.patch(
+        "/api/account/password",
+        json={"currentPassword": "current-password-123", "newPassword": "short"},
+    )
+    assert invalid_new_password.status_code == 400
+
+    changed = client.patch(
+        "/api/account/password",
+        json={"currentPassword": "current-password-123", "newPassword": "new-password-456"},
+    )
+    assert changed.status_code == 200
+    assert check_password_hash(db.session.get(User, user.id).password_hash, "new-password-456")
+
+
+def test_password_change_requires_login_and_local_password(client):
+    from werkzeug.security import generate_password_hash
+
+    unauthorized = client.patch(
+        "/api/account/password",
+        json={"currentPassword": "current-password-123", "newPassword": "new-password-456"},
+    )
+    assert unauthorized.status_code == 401
+
+    google_user = create_user(google_sub="google-password-user", email="google-password@example.com")
+    login_as(client, google_user)
+    external_account = client.patch(
+        "/api/account/password",
+        json={"currentPassword": "current-password-123", "newPassword": "new-password-456"},
+    )
+    assert external_account.status_code == 400
+
+    local_user = create_user(
+        google_sub="local-password-user",
+        email="local-password@example.com",
+        password_hash=generate_password_hash("current-password-123"),
+    )
+    login_as(client, local_user)
+    same_password = client.patch(
+        "/api/account/password",
+        json={"currentPassword": "current-password-123", "newPassword": "current-password-123"},
+    )
+    assert same_password.status_code == 400
+
+
 def test_resend_email_sender_uses_https_api_when_configured(monkeypatch):
     import app as backend
 
@@ -665,6 +1909,46 @@ def test_resend_email_sender_uses_https_api_when_configured(monkeypatch):
     assert called["headers"]["Authorization"] == "Bearer test-key-only"
     assert called["json"]["to"] == [user.email]
     assert "123456" in called["json"]["text"]
+
+
+def test_smtp_email_uses_smtp_from_when_resend_sender_is_empty(monkeypatch):
+    import app as backend
+
+    user = User(google_sub="smtp-test-user", email="smtp@example.com", name="SMTP")
+    sent = {}
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout):
+            sent.update(host=host, port=port, timeout=timeout)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def starttls(self):
+            sent["starttls"] = True
+
+        def send_message(self, message):
+            sent["message"] = message
+
+    monkeypatch.setenv("RESEND_FROM", "")
+    monkeypatch.setenv("SMTP_FROM", "AgroCórdoba <no-reply@example.com>")
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("SMTP_PORT", "587")
+    monkeypatch.setenv("SMTP_USE_SSL", "false")
+    monkeypatch.setenv("SMTP_USE_TLS", "true")
+    monkeypatch.setattr(backend.smtplib, "SMTP", FakeSMTP)
+
+    backend._send_settings_code(user, "123456")
+
+    assert sent["host"] == "smtp.example.com"
+    assert sent["port"] == 587
+    assert sent["starttls"] is True
+    assert sent["message"]["From"] == "AgroCórdoba <no-reply@example.com>"
+    assert sent["message"]["To"] == user.email
 
 
 def test_password_recovery_rejects_malformed_codes_without_consuming_attempts(client, monkeypatch):

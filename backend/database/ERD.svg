@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1510" viewBox="0 0 1500 1510" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1650" viewBox="0 0 1500 1650" role="img" aria-labelledby="title description">
   <title id="title">Diagrama entidad-relación normalizado de AgroCórdoba</title>
-  <desc id="description">Diagrama en español de las diez tablas SQLite y sus relaciones, alineado con backend/app.py.</desc>
+  <desc id="description">Diagrama en español de las trece tablas SQLite y sus relaciones, alineado con backend/app.py.</desc>
   <defs>
     <style>
       text { font-family: Arial, Helvetica, sans-serif; fill: #17324d; }
@@ -20,9 +20,9 @@
       <path d="M0,0 L8,4 L0,8 z" fill="#68849b"/>
     </marker>
   </defs>
-  <rect width="1500" height="1510" fill="#f4f7fa"/>
+  <rect width="1500" height="1650" fill="#f4f7fa"/>
   <text x="36" y="44" class="heading">AgroCórdoba — Diagrama entidad-relación</text>
-  <text x="36" y="70" class="subheading">SQLite · 10 tablas · PK: clave primaria · FK: clave foránea · UK: valor único</text>
+  <text x="36" y="70" class="subheading">SQLite / PostgreSQL · 13 tablas · PK: clave primaria · FK: clave foránea · UK: valor único</text>
   <text x="36" y="88" class="subheading">Nombres de campos traducidos; los nombres reales están en backend/database/schema.sql.</text>
 
   <g transform="translate(40 95)">
@@ -34,7 +34,8 @@
     <text x="18" y="86" class="field">nombre · avatar · rol · ciudad · tipo de negocio</text>
     <text x="18" y="107" class="field">registro · hash de contraseña · género · teléfono</text>
     <text x="18" y="128" class="field">nombre de finca · asociación · estado</text>
-    <text x="18" y="164" class="field">Una cuenta puede ser cliente, productor o administrador.</text>
+    <text x="18" y="149" class="field">dirección privada de finca para recogidas acordadas</text>
+    <text x="18" y="185" class="field">Una cuenta puede ser cliente, productor o administrador.</text>
   </g>
 
   <g transform="translate(40 510)">
@@ -77,6 +78,18 @@
     <text x="18" y="149" class="field">vencimiento · envio · intentos</text>
   </g>
 
+  <g transform="translate(40 1330)">
+    <rect class="table" width="440" height="180"/>
+    <path class="tablehead" d="M9 0h422a9 9 0 0 1 9 9v34H0V9a9 9 0 0 1 9-9z"/>
+    <text x="18" y="28" class="tablename">REFERENCIA DE PRECIO SIPSA</text>
+    <text x="18" y="47" class="physical-table">Tabla real: sipsa_price_reference</text>
+    <text x="18" y="65" class="field"><tspan class="key">PK</tspan> id · clave y nombre normalizado del producto</text>
+    <text x="18" y="86" class="field">mercado · precio en COP/kg · fecha del boletín</text>
+    <text x="18" y="107" class="field">URL de la fuente oficial</text>
+    <text x="18" y="128" class="field">Única por producto, mercado y fecha</text>
+    <text x="18" y="149" class="field">Conserva el último dato si el origen no responde</text>
+  </g>
+
   <g transform="translate(610 95)">
     <rect class="table" width="520" height="445"/>
     <path class="tablehead" d="M9 0h502a9 9 0 0 1 9 9v34H0V9a9 9 0 0 1 9-9z"/>
@@ -115,11 +128,13 @@
     <text x="18" y="185" class="field">asociacion y WhatsApp del productor</text>
     <text x="18" y="206" class="field">nombre · correo y telefono del cliente</text>
     <text x="18" y="227" class="field">tipo de negocio y ciudad del cliente</text>
-    <text x="18" y="263" class="field">cantidad · destino · costo del transporte</text>
-    <text x="18" y="284" class="field">subtotal · total · tasa de cambio (COP)</text>
-    <text x="18" y="305" class="field">descuento · notas · estado · fecha de creación</text>
-    <text x="18" y="341" class="field">La cotización conserva los datos mostrados al crearla,</text>
-    <text x="18" y="362" class="field">aunque después se elimine la publicación del producto.</text>
+    <text x="18" y="263" class="field">cantidad · destino · modalidad · forma de pago</text>
+    <text x="18" y="284" class="field">dirección y coordenadas de entrega (privadas)</text>
+    <text x="18" y="305" class="field">costo de transporte · subtotal · total · tasa COP</text>
+    <text x="18" y="326" class="field">descuento · notas · estado · fecha de creación</text>
+    <text x="18" y="362" class="field">La cotización conserva los datos mostrados al crearla,</text>
+    <text x="18" y="383" class="field">aunque después se elimine la publicación del producto.</text>
+    <text x="18" y="404" class="field">Las direcciones solo se revelan tras acordar la oferta.</text>
   </g>
 
   <g transform="translate(1210 440)">
@@ -140,6 +155,37 @@
     <text x="16" y="65" class="field"><tspan class="key">PK</tspan> id · <tspan class="key">FK</tspan> id de usuario → USUARIO.id</text>
     <text x="16" y="86" class="field"><tspan class="key">FK</tspan> id de cotización → COTIZACIÓN.id</text>
     <text x="16" y="107" class="field">Única por usuario y cotización</text>
+  </g>
+
+  <g transform="translate(1210 970)">
+    <rect class="table" width="250" height="300"/>
+    <path class="tablehead" d="M9 0h232a9 9 0 0 1 9 9v34H0V9a9 9 0 0 1 9-9z"/>
+    <text x="16" y="28" class="tablename">OFERTA DE COTIZACIÓN</text>
+    <text x="16" y="47" class="physical-table">Tabla real: quotation_offer</text>
+    <text x="16" y="65" class="field"><tspan class="key">PK</tspan> id</text>
+    <text x="16" y="86" class="field"><tspan class="key">FK</tspan> id de cotización → COTIZACIÓN.id</text>
+    <text x="16" y="107" class="field"><tspan class="key">FK</tspan> id del emisor → USUARIO.id</text>
+    <text x="16" y="128" class="field">nombre del emisor</text>
+    <text x="16" y="149" class="field">precio unitario · cantidad · transporte</text>
+    <text x="16" y="170" class="field">total ofrecido</text>
+    <text x="16" y="191" class="field">producto y precio de referencia SIPSA</text>
+    <text x="16" y="212" class="field">mercado · fecha · URL de la fuente</text>
+    <text x="16" y="233" class="field">estado · fechas de creación y respuesta</text>
+    <text x="16" y="254" class="field">Instantánea histórica de cada oferta</text>
+  </g>
+
+  <g transform="translate(1210 1320)">
+    <rect class="table" width="250" height="210"/>
+    <path class="tablehead" d="M9 0h232a9 9 0 0 1 9 9v34H0V9a9 9 0 0 1 9-9z"/>
+    <text x="16" y="28" class="tablename">MENSAJE DE COTIZACIÓN</text>
+    <text x="16" y="47" class="physical-table">Tabla real: quotation_message</text>
+    <text x="16" y="65" class="field"><tspan class="key">PK</tspan> id</text>
+    <text x="16" y="86" class="field"><tspan class="key">FK</tspan> id de cotización → COTIZACIÓN.id</text>
+    <text x="16" y="107" class="field"><tspan class="key">FK</tspan> id del emisor → USUARIO.id</text>
+    <text x="16" y="128" class="field">nombre del emisor · contenido</text>
+    <text x="16" y="149" class="field">tipo de mensaje · oferta opcional</text>
+    <text x="16" y="170" class="field">fecha de creación · fecha de lectura</text>
+    <text x="16" y="191" class="field">Historial persistido por cotización</text>
   </g>
 
   <path class="edge" marker-end="url(#arrow)" d="M40 350 H20 V580 H40"/>
@@ -164,9 +210,17 @@
   <text x="830" y="590" class="edge-label">1 : N (favoritos)</text>
   <path class="edge" marker-end="url(#arrow)" d="M480 415 H555 V1220 H1185 V835 H1210"/>
   <text x="900" y="1210" class="edge-label">1 : N (usuario que lee)</text>
-  <path class="edge" marker-end="url(#arrow)" d="M1130 1000 H1210"/>
-  <text x="1135" y="990" class="edge-label">1 : N</text>
+  <path class="edge" marker-end="url(#arrow)" d="M1130 1020 H1210"/>
+  <text x="1135" y="1010" class="edge-label">1 : N (ofertas)</text>
+  <path class="edge" marker-end="url(#arrow)" d="M1130 1150 H1170 V1390 H1210"/>
+  <text x="1135" y="1140" class="edge-label">1 : N (mensajes)</text>
+  <path class="edge" marker-end="url(#arrow)" d="M1335 1270 V1320"/>
+  <text x="1345" y="1305" class="edge-label">0..1 : 1</text>
+  <path class="edge" marker-end="url(#arrow)" d="M480 335 H500 V1570 H1185 V1080 H1210"/>
+  <text x="730" y="1560" class="edge-label">1 : N (emisor)</text>
+  <path class="edge" marker-end="url(#arrow)" d="M480 335 H510 V1600 H1195 V1390 H1210"/>
+  <text x="730" y="1590" class="edge-label">1 : N (emisor de mensajes)</text>
 
   <text x="610" y="1260" class="note">La referencia opcional permite conservar una cotización histórica si se elimina el producto.</text>
-  <text x="610" y="1280" class="note">La base de muestra contiene datos ficticios; las cotizaciones guardan una copia de sus datos.</text>
+  <text x="610" y="1280" class="note">La base de muestra contiene datos ficticios; las ofertas guardan el precio SIPSA usado al negociarlas.</text>
 </svg>

@@ -483,7 +483,7 @@ export const INITIAL_QUOTATIONS: QuotationRequest[] = [
     discountPercent: 10,
     notes: 'Despacho en camión estacas para abasto en Granabastos.',
     createdAt: '2026-09-19 16:40',
-    status: 'Contactado WhatsApp',
+    status: 'En negociación',
   },
 ];
 

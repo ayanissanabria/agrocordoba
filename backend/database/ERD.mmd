@@ -1,4 +1,4 @@
-%% Entidades y campos traducidos; sus tablas físicas se documentan en ERD.svg y schema.sql.
+%% Entidades y campos traducidos; el esquema físico se documenta también en schema.sql.
 erDiagram
     USUARIO {
         string id PK
@@ -14,6 +14,7 @@ erDiagram
         string genero
         string telefono
         string nombre_finca
+        string direccion_privada_finca
         string asociacion
         string estado
     }
@@ -97,6 +98,11 @@ erDiagram
         string ciudad_cliente
         float cantidad_kg
         string zona_destino
+        string modalidad_entrega
+        string direccion_entrega_privada
+        float latitud_entrega_privada
+        float longitud_entrega_privada
+        string forma_pago_preferida
         float costo_transporte_cop
         float subtotal_cop
         float total_cop
@@ -105,6 +111,44 @@ erDiagram
         string notas
         string estado
         datetime fecha_creacion
+    }
+    MENSAJE_COTIZACION {
+        string id PK
+        string id_cotizacion FK
+        string id_emisor FK
+        string nombre_emisor
+        string contenido
+        string tipo_mensaje
+        string id_oferta FK
+        datetime fecha_creacion
+        datetime fecha_lectura
+    }
+    OFERTA_COTIZACION {
+        string id PK
+        string id_cotizacion FK
+        string id_emisor FK
+        string nombre_emisor
+        float precio_unitario_cop
+        float cantidad_kg
+        float transporte_cop
+        float total_cop
+        string producto_referencia_sipsa
+        float precio_referencia_cop_kg
+        string mercado_referencia
+        string fecha_referencia
+        string url_fuente
+        string estado
+        datetime fecha_creacion
+        datetime fecha_respuesta
+    }
+    REFERENCIA_PRECIO_SIPSA {
+        int id PK
+        string clave_producto
+        string nombre_producto
+        string mercado
+        float precio_cop_por_kg
+        date fecha_boletin
+        string url_fuente
     }
     FAVORITO {
         int id PK
@@ -126,6 +170,11 @@ erDiagram
     USUARIO ||--o{ COTIZACION : "solicita como cliente"
     USUARIO ||--o{ COTIZACION : "recibe como productor"
     PUBLICACION_PRODUCTO o|--o{ COTIZACION : "se asocia a"
+    USUARIO ||--o{ MENSAJE_COTIZACION : "envía"
+    COTIZACION ||--o{ MENSAJE_COTIZACION : "registra"
+    USUARIO ||--o{ OFERTA_COTIZACION : "envía"
+    COTIZACION ||--o{ OFERTA_COTIZACION : "negocia"
+    OFERTA_COTIZACION o|--o| MENSAJE_COTIZACION : "se comunica en"
     USUARIO ||--o{ FAVORITO : "guarda"
     USUARIO ||--o{ NOTIFICACION_LEIDA : "consulta"
     COTIZACION ||--o{ NOTIFICACION_LEIDA : "se marca como leída"

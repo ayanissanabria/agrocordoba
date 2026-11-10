@@ -18,6 +18,7 @@ CREATE TABLE user (
     gender VARCHAR(20) NOT NULL,
     phone VARCHAR(30) NOT NULL,
     farm_name VARCHAR(160) NOT NULL,
+    farm_address VARCHAR(500) NOT NULL,
     association VARCHAR(200) NOT NULL,
     status VARCHAR(20) NOT NULL,
     PRIMARY KEY (id)
@@ -146,6 +147,11 @@ CREATE TABLE quotation_record (
     client_city VARCHAR(100) NOT NULL,
     quantity_kg FLOAT NOT NULL,
     destination_zone VARCHAR(40) NOT NULL,
+    fulfillment_method VARCHAR(20) NOT NULL,
+    delivery_address VARCHAR(500) NOT NULL,
+    delivery_latitude FLOAT,
+    delivery_longitude FLOAT,
+    payment_method VARCHAR(20) NOT NULL,
     freight_cop FLOAT NOT NULL,
     subtotal_cop FLOAT NOT NULL,
     total_cop FLOAT NOT NULL,
@@ -164,6 +170,65 @@ CREATE INDEX ix_quotation_record_client_id ON quotation_record (client_id);
 CREATE INDEX ix_quotation_record_producer_id ON quotation_record (producer_id);
 CREATE INDEX ix_quotation_record_product_id ON quotation_record (product_id);
 CREATE INDEX ix_quotation_record_product_listing_id ON quotation_record (product_listing_id);
+
+CREATE TABLE quotation_offer (
+    id VARCHAR(36) NOT NULL,
+    quotation_id VARCHAR(36) NOT NULL,
+    sender_id VARCHAR(36) NOT NULL,
+    sender_name VARCHAR(160) NOT NULL,
+    unit_price_cop FLOAT NOT NULL,
+    quantity_kg FLOAT NOT NULL,
+    freight_cop FLOAT NOT NULL,
+    total_cop FLOAT NOT NULL,
+    reference_product VARCHAR(120) NOT NULL,
+    reference_price_cop_kg FLOAT NOT NULL,
+    reference_market VARCHAR(160) NOT NULL,
+    reference_date VARCHAR(80) NOT NULL,
+    reference_source_url VARCHAR(500) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL,
+    responded_at DATETIME,
+    PRIMARY KEY (id),
+    FOREIGN KEY(quotation_id) REFERENCES quotation_record (id) ON DELETE CASCADE,
+    FOREIGN KEY(sender_id) REFERENCES user (id)
+);
+
+CREATE INDEX ix_quotation_offer_quotation_id ON quotation_offer (quotation_id);
+CREATE INDEX ix_quotation_offer_sender_id ON quotation_offer (sender_id);
+
+CREATE TABLE quotation_message (
+    id VARCHAR(36) NOT NULL,
+    quotation_id VARCHAR(36) NOT NULL,
+    sender_id VARCHAR(36) NOT NULL,
+    sender_name VARCHAR(160) NOT NULL,
+    content VARCHAR(2000) NOT NULL,
+    message_type VARCHAR(20) NOT NULL DEFAULT 'text',
+    offer_id VARCHAR(36),
+    created_at DATETIME NOT NULL,
+    read_at DATETIME,
+    PRIMARY KEY (id),
+    FOREIGN KEY(quotation_id) REFERENCES quotation_record (id) ON DELETE CASCADE,
+    FOREIGN KEY(sender_id) REFERENCES user (id),
+    FOREIGN KEY(offer_id) REFERENCES quotation_offer (id) ON DELETE SET NULL
+);
+
+CREATE INDEX ix_quotation_message_quotation_id ON quotation_message (quotation_id);
+CREATE INDEX ix_quotation_message_sender_id ON quotation_message (sender_id);
+
+CREATE TABLE sipsa_price_reference (
+    id INTEGER NOT NULL,
+    product_key VARCHAR(120) NOT NULL,
+    product_name VARCHAR(120) NOT NULL,
+    market VARCHAR(160) NOT NULL,
+    price_cop_kg FLOAT NOT NULL,
+    report_date DATE NOT NULL,
+    report_url VARCHAR(500) NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uq_sipsa_price_reference_daily UNIQUE (product_key, market, report_date)
+);
+
+CREATE INDEX ix_sipsa_price_reference_product_date
+    ON sipsa_price_reference (product_key, report_date);
 
 CREATE TABLE read_notification (
     id INTEGER NOT NULL,

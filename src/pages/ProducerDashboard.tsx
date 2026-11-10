@@ -25,6 +25,8 @@ import { MUNICIPALITIES, USD_EXCHANGE_RATE } from '../data/mockData';
 import { formatCop } from '../utils/formatters';
 import { AgroCordobaBrand } from '../components/AgroCordobaBrand';
 import { AccountSettings } from '../components/AccountSettings';
+import { PriceReferencePanel } from '../components/PriceReferencePanel';
+import { QuotationConversation } from '../components/QuotationConversation';
 
 import {
   Product,
@@ -46,8 +48,9 @@ interface ProducerDashboardProps {
   onUpdateProduct: (product: Product) => Promise<void> | void;
   onDeleteProduct: (id: string) => Promise<void> | void;
   onUpdateQuotationStatus: (id: string, status: QuotationStatus) => Promise<void> | void;
-  onUpdateProfile: (updated: Partial<UserProfile>) => void;
+  onUpdateProfile: (updated: Partial<UserProfile>) => Promise<void> | void;
   onLogout: () => void;
+  unreadMessageCounts?: Record<string, number>;
 }
 
 type Section = 'inicio' | 'productos' | 'cotizaciones' | 'perfil' | 'configuracion';
@@ -68,13 +71,21 @@ const STATUSES: QuotationStatus[] = [
   'Pendiente',
   'Cotizado',
   'Contactado WhatsApp',
+  'En negociación',
+  'Acordado',
+  'Listo para recoger',
+  'Entregado',
   'Cerrado',
 ];
 
 const STATUS_STYLE: Record<QuotationStatus, string> = {
   Pendiente: 'bg-[#fff1e5] text-[#a14b00] border-[#f3cfae]',
   Cotizado: 'bg-[#e6f0ff] text-[#1d4f91] border-[#c4d8f5]',
+  'En negociación': 'bg-[#fff1e5] text-[#a14b00] border-[#f3cfae]',
+  Acordado: 'bg-[#e3f7ea] text-[#0f6b3a] border-[#b9e6c9]',
   'Contactado WhatsApp': 'bg-[#e3f7ea] text-[#0f6b3a] border-[#b9e6c9]',
+  'Listo para recoger': 'bg-[#e3f7ea] text-[#0f6b3a] border-[#b9e6c9]',
+  Entregado: 'bg-[#e3f7ea] text-[#0f6b3a] border-[#b9e6c9]',
   Cerrado: 'bg-[#eef1ef] text-[#59645e] border-[#d5ddd8]',
 };
 
@@ -426,24 +437,18 @@ const ProductForm: React.FC<ProductFormProps> = ({
 
 interface QuotationCardProps {
   quotation: QuotationRequest;
-  producerName: string;
+  currentUserId: string;
+  unreadCount: number;
   onChangeStatus: (status: QuotationStatus) => void;
 }
 
 const QuotationCard: React.FC<QuotationCardProps> = ({
   quotation: q,
-  producerName,
+  currentUserId,
+  unreadCount,
   onChangeStatus,
 }) => {
-  const phone = (q.clientPhone || '').replace(/[^0-9]/g, '');
-  const message =
-    `Hola ${q.clientName}, le saluda ${producerName} desde AgroCórdoba. ` +
-    `Recibí su solicitud de ${kg(q.quantityKg)} de ${q.productName} (${q.productVariety}) ` +
-    `con destino ${q.destinationZone}. El valor estimado es ${formatCop(q.totalCop)}. ` +
-    `¿Coordinamos la entrega?`;
-  const whatsappUrl = phone
-    ? `https://wa.me/${phone}?text=${encodeURIComponent(message)}`
-    : '';
+  const displayStatus = q.status === 'Contactado WhatsApp' ? 'En negociación' : q.status;
 
   return (
     <article className="rounded-2xl border border-[#e2e7df] bg-white p-5 shadow-[0_2px_10px_rgba(24,36,29,0.035)] sm:p-6">
@@ -457,8 +462,8 @@ const QuotationCard: React.FC<QuotationCardProps> = ({
             {q.clientName} ({q.clientBusinessType}), {q.clientCity || q.destinationZone}
           </p>
         </div>
-        <span className={`rounded-full border px-2.5 py-1 text-xs font-bold ${STATUS_STYLE[q.status]}`}>
-          {q.status}
+        <span className={`rounded-full border px-2.5 py-1 text-xs font-bold ${STATUS_STYLE[displayStatus]}`}>
+          {displayStatus}
         </span>
       </div>
 
@@ -488,34 +493,48 @@ const QuotationCard: React.FC<QuotationCardProps> = ({
       )}
 
       <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center">
-        {whatsappUrl && (
-          <a
-            href={whatsappUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            onClick={() => {
-              if (q.status === 'Pendiente' || q.status === 'Cotizado') {
-                onChangeStatus('Contactado WhatsApp');
-              }
-            }}
-            className="inline-flex items-center justify-center gap-2 rounded-lg bg-[#1f9d55] px-4 py-2.5 text-sm font-bold text-white hover:bg-[#178246] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1f9d55]"
-          >
-            <Phone size={16} />
-            Escribir por WhatsApp
-          </a>
+        {unreadCount > 0 && (
+          <span role="status" className="rounded-full bg-red-100 px-2.5 py-1 text-xs font-bold text-red-800">
+            {unreadCount} {unreadCount === 1 ? 'mensaje pendiente' : 'mensajes pendientes'}
+          </span>
         )}
-        <label className="flex items-center gap-2 text-sm text-[#59645e] sm:ml-auto">
-          Estado
-          <select
-            value={q.status}
-            onChange={(e) => onChangeStatus(e.target.value as QuotationStatus)}
-            className="rounded-lg border border-[#c9d6cd] bg-white px-2.5 py-2 text-sm font-semibold text-[#2c3a32] focus:border-[#004d36] focus:outline-none focus:ring-2 focus:ring-[#b4f0cd]"
+        {q.clientId && q.producerId && (
+          <QuotationConversation quotationId={q.id} currentUserId={currentUserId} participantName={q.clientName} productName={q.productName} quotationStatus={q.status} initialUnitPrice={q.quantityKg > 0 ? q.subtotalCop / q.quantityKg : 0} initialQuantityKg={q.quantityKg} initialFreightCop={q.freightCop} fulfillmentMethod={q.fulfillmentMethod} paymentMethod={q.paymentMethod} deliveryAddress={q.deliveryAddress} deliveryLatitude={q.deliveryLatitude} deliveryLongitude={q.deliveryLongitude} producerPickupAddress={q.producerPickupAddress} />
+        )}
+        {q.status === 'Acordado' ? (
+          <button
+            type="button"
+            onClick={() => onChangeStatus(q.fulfillmentMethod === 'recoger' ? 'Listo para recoger' : 'Entregado')}
+            className="rounded-lg bg-[#004d36] px-3 py-2 text-sm font-bold text-white hover:bg-[#003622] sm:ml-auto"
           >
-            {STATUSES.map((s) => (
-              <option key={s} value={s}>{s}</option>
-            ))}
-          </select>
-        </label>
+            {q.fulfillmentMethod === 'recoger' ? 'Marcar listo para recoger' : 'Confirmar entrega al comprador'}
+          </button>
+        ) : q.status === 'En negociación' || q.status === 'Contactado WhatsApp' ? (
+          <span className="text-sm font-semibold text-[#59645e] sm:ml-auto">
+            Negocia la oferta en la conversación; al aceptarla el pedido quedará acordado.
+          </span>
+        ) : q.status === 'Entregado' || q.status === 'Listo para recoger' ? (
+          <span className="rounded-lg border border-[#c9d6cd] bg-[#f6f7f3] px-3 py-2 text-sm font-semibold text-[#2c3a32] sm:ml-auto">
+            {q.status === 'Entregado' ? 'Entrega registrada' : 'Pedido listo para recoger'} · esperando confirmación del comprador
+          </span>
+        ) : q.status === 'Cerrado' ? (
+          <span className="rounded-lg border border-[#c9d6cd] bg-[#f6f7f3] px-3 py-2 text-sm font-semibold text-[#2c3a32] sm:ml-auto">
+            Venta cerrada: recepción confirmada por el comprador.
+          </span>
+        ) : (
+          <label className="flex items-center gap-2 text-sm text-[#59645e] sm:ml-auto">
+            Estado
+            <select
+              value={q.status}
+              onChange={(e) => onChangeStatus(e.target.value as QuotationStatus)}
+              className="rounded-lg border border-[#c9d6cd] bg-white px-2.5 py-2 text-sm font-semibold text-[#2c3a32] focus:border-[#004d36] focus:outline-none focus:ring-2 focus:ring-[#b4f0cd]"
+            >
+              {STATUSES.filter((status) => ['Pendiente', 'Cotizado', 'Contactado WhatsApp'].includes(status)).map((status) => (
+                <option key={status} value={status}>{status}</option>
+              ))}
+            </select>
+          </label>
+        )}
       </div>
     </article>
   );
@@ -529,6 +548,7 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
   user,
   products,
   quotations,
+  unreadMessageCounts = {},
   onAddProduct,
   onUpdateProduct,
   onDeleteProduct,
@@ -561,6 +581,10 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
   }, [quotations, myProducts, user.id, user.name, user.authProvider]);
 
   const pending = myQuotations.filter((q) => q.status === 'Pendiente');
+  const unreadMessageCount = myQuotations.reduce(
+    (total, quotation) => total + (unreadMessageCounts[quotation.id] || 0),
+    0
+  );
 
   const requestedKgByProduct = useMemo(() => {
     const map: Record<string, number> = {};
@@ -624,6 +648,7 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
     name: user.name,
     phone: user.phone,
     farmName: user.farmName || '',
+    farmAddress: user.farmAddress || '',
     association: user.association || '',
     city: user.city,
   });
@@ -637,22 +662,26 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
     if (file.size > 10 * 1024 * 1024) return showNotice('La imagen no puede superar los 10 MB.');
     try {
       const avatar = await resizeImage(file);
-      onUpdateProfile({ avatar });
-      myProducts.forEach((product) => onUpdateProduct({ ...product, producerPhoto: avatar }));
+      await onUpdateProfile({ avatar });
+      await Promise.all(myProducts.map((product) => onUpdateProduct({ ...product, producerPhoto: avatar })));
       showNotice('Foto de perfil actualizada.');
     } catch (error) {
       showNotice((error as Error).message);
     }
   };
 
-  const deleteProducerPhoto = () => {
+  const deleteProducerPhoto = async () => {
     if (!window.confirm('¿Eliminar tu foto de perfil?')) return;
-    onUpdateProfile({ avatar: '' });
-    myProducts.forEach((product) => onUpdateProduct({ ...product, producerPhoto: '' }));
-    showNotice('Foto de perfil eliminada.');
+    try {
+      await onUpdateProfile({ avatar: '' });
+      await Promise.all(myProducts.map((product) => onUpdateProduct({ ...product, producerPhoto: '' })));
+      showNotice('Foto de perfil eliminada.');
+    } catch (error) {
+      showNotice((error as Error).message || 'No se pudo eliminar la foto.');
+    }
   };
 
-  const handleSaveProfile = (e: React.FormEvent) => {
+  const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!profile.name.trim() || !profile.phone.trim()) {
       showNotice('El nombre y el teléfono son obligatorios.');
@@ -663,30 +692,34 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
       name: profile.name.trim(),
       phone: profile.phone.trim(),
       farmName: profile.farmName.trim(),
+      farmAddress: profile.farmAddress.trim(),
       association: profile.association.trim(),
       city: profile.city,
     };
 
     // Los productos publicados muestran los datos del productor
-    myProducts.forEach((p) =>
-      onUpdateProduct({
+    try {
+      await Promise.all(myProducts.map((p) =>
+        onUpdateProduct({
         ...p,
         producerName: updated.name,
         producerAssociation: updated.association || 'Independiente',
         producerWhatsapp: updated.phone.replace(/[^0-9]/g, ''),
-      })
-    );
-
-    onUpdateProfile(updated);
-    showNotice('Perfil actualizado.');
+        })
+      ));
+      await onUpdateProfile(updated);
+      showNotice('Perfil actualizado.');
+    } catch (error) {
+      showNotice((error as Error).message || 'No se pudo guardar el perfil.');
+    }
   };
 
   /* ---------- Navegación ---------- */
 
-  const tabs: { id: Section; label: string; icon: React.ReactNode; badge?: number }[] = [
+  const tabs: { id: Section; label: string; icon: React.ReactNode; badge?: number; unreadBadge?: number }[] = [
     { id: 'inicio', label: 'Inicio', icon: <Home size={18} /> },
     { id: 'productos', label: 'Mis productos', icon: <Package size={18} />, badge: myProducts.length },
-    { id: 'cotizaciones', label: 'Cotizaciones', icon: <MessageSquareText size={18} />, badge: pending.length },
+    { id: 'cotizaciones', label: 'Cotizaciones', icon: <MessageSquareText size={18} />, badge: pending.length, unreadBadge: unreadMessageCount },
     { id: 'perfil', label: 'Mi perfil', icon: <UserRound size={18} /> },
     { id: 'configuracion', label: 'Configuración', icon: <Settings size={18} /> },
   ];
@@ -694,7 +727,7 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
   const filteredQuotations =
     statusFilter === 'Todas'
       ? myQuotations
-      : myQuotations.filter((q) => q.status === statusFilter);
+      : myQuotations.filter((q) => q.status === statusFilter || (statusFilter === 'En negociación' && q.status === 'Contactado WhatsApp'));
 
   /* ---------- Lista de productos (se usa en Inicio y Mis productos) ---------- */
 
@@ -843,6 +876,11 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
                         {tab.badge}
                       </span>
                     )}
+                    {!!tab.unreadBadge && (
+                      <span className="rounded-full bg-red-100 px-1.5 py-0.5 text-[11px] font-bold text-red-800">
+                        {tab.unreadBadge}
+                      </span>
+                    )}
                   </button>
                 </li>
               );
@@ -892,7 +930,7 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
             </section>
 
             {/* Resumen en una franja */}
-            <dl className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <div className="rounded-2xl border border-[#e2e7df] bg-white p-5 shadow-[0_2px_10px_rgba(24,36,29,0.035)] sm:p-6">
                 <dt className="text-[13px] font-medium text-[#5b665f]">Productos publicados</dt>
                 <dd className="mt-3 font-editorial text-3xl font-semibold text-[#1f4d36]">{myProducts.length}</dd>
@@ -905,7 +943,13 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
                 <dt className="text-[13px] font-medium text-[#5b665f]">Cotizaciones pendientes</dt>
                 <dd className="mt-3 font-editorial text-3xl font-semibold text-[#1f4d36]">{pending.length}</dd>
               </div>
+              <div className="rounded-2xl border border-[#e2e7df] bg-white p-5 shadow-[0_2px_10px_rgba(24,36,29,0.035)] sm:p-6">
+                <dt className="text-[13px] font-medium text-[#5b665f]">Mensajes sin leer</dt>
+                <dd className="mt-3 font-editorial text-3xl font-semibold text-[#1f4d36]">{unreadMessageCount}</dd>
+              </div>
             </dl>
+
+            <PriceReferencePanel productNames={myProducts.map((product) => product.name)} />
 
             <section aria-labelledby="stock-alerts-title" className="rounded-2xl border bg-white p-5 shadow-[0_2px_10px_rgba(24,36,29,0.035)] sm:p-6">
               <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
@@ -965,7 +1009,8 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
                     <QuotationCard
                       key={q.id}
                       quotation={q}
-                      producerName={user.name}
+                      currentUserId={user.id}
+                      unreadCount={unreadMessageCounts[q.id] || 0}
                       onChangeStatus={(s) => void Promise.resolve(onUpdateQuotationStatus(q.id, s)).catch((error: Error) => showNotice(error.message || 'No se pudo actualizar la cotización.'))}
                     />
                   ))}
@@ -1031,12 +1076,14 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
           <div>
             <h1 className="font-editorial text-3xl font-semibold text-[#173b2b]">Cotizaciones recibidas</h1>
             <p className="mt-1 text-sm text-[#59645e]">
-              Responde por WhatsApp y actualiza el estado para llevar el control de tus ventas.
+              Negocia en la conversación de AgroCórdoba y actualiza el estado para llevar el control de tus ventas.
             </p>
 
             <div className="mt-5 flex gap-2 overflow-x-auto pb-1" role="group" aria-label="Filtrar por estado">
               {(['Todas', ...STATUSES] as const).map((s) => {
-                const count = s === 'Todas' ? myQuotations.length : myQuotations.filter((q) => q.status === s).length;
+                const count = s === 'Todas'
+                  ? myQuotations.length
+                  : myQuotations.filter((q) => q.status === s || (s === 'En negociación' && q.status === 'Contactado WhatsApp')).length;
                 const active = statusFilter === s;
                 return (
                   <button
@@ -1066,7 +1113,8 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
                   <QuotationCard
                     key={q.id}
                     quotation={q}
-                    producerName={user.name}
+                    currentUserId={user.id}
+                    unreadCount={unreadMessageCounts[q.id] || 0}
                     onChangeStatus={(s) => void Promise.resolve(onUpdateQuotationStatus(q.id, s)).catch((error: Error) => showNotice(error.message || 'No se pudo actualizar la cotización.'))}
                   />
                 ))
@@ -1080,7 +1128,7 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
           <form onSubmit={handleSaveProfile} className="max-w-2xl">
             <h1 className="font-editorial text-3xl font-semibold text-[#173b2b]">Mi perfil</h1>
             <p className="mt-1 text-sm text-[#59645e]">
-              Estos datos los ven los compradores en tus productos.
+              Tu nombre, asociación y teléfono aparecen en tus productos; la dirección exacta solo se comparte en pedidos acordados para recoger.
             </p>
 
             <div className="mt-5 flex flex-wrap items-center gap-4 rounded-2xl border border-[#e2e7df] bg-white p-5 shadow-[0_2px_10px_rgba(24,36,29,0.035)]">
@@ -1126,6 +1174,11 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
                 <label className={labelClass} htmlFor="pr-farm">Nombre de la finca</label>
                 <input id="pr-farm" className={inputClass} placeholder="Ej: Finca La Esperanza" value={profile.farmName} onChange={(e) => setProfile({ ...profile, farmName: e.target.value })} />
               </div>
+              <div className="sm:col-span-2">
+                <label className={labelClass} htmlFor="pr-farm-address">Dirección privada para recogidas acordadas</label>
+                <input id="pr-farm-address" className={inputClass} placeholder="Dirección o indicaciones para llegar a la finca" value={profile.farmAddress} onChange={(e) => setProfile({ ...profile, farmAddress: e.target.value })} />
+                <p className="mt-1 text-xs text-[#59645e]">Solo se comparte con el comprador cuando acuerden un pedido para recoger.</p>
+              </div>
               <div>
                 <label className={labelClass} htmlFor="pr-assoc">Asociación</label>
                 <input id="pr-assoc" className={inputClass} placeholder="O escribe Independiente" value={profile.association} onChange={(e) => setProfile({ ...profile, association: e.target.value })} />
@@ -1151,7 +1204,7 @@ export const ProducerDashboard: React.FC<ProducerDashboardProps> = ({
             <h1 className="font-editorial text-3xl font-semibold text-[#173b2b]">Configuración</h1>
             <p className="mt-1 text-sm text-[#59645e]">Administra los datos y avisos de tu cuenta de productor.</p>
             <div className="mt-6">
-              <AccountSettings user={user} onUpdateProfile={onUpdateProfile} />
+              <AccountSettings user={user} onUpdateProfile={onUpdateProfile} onAccountDeleted={onLogout} />
             </div>
           </div>
         )}

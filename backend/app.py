@@ -4,33 +4,53 @@ import binascii
 import hashlib
 import hmac
 import html
+import io
 import json
+import math
 import re
 import secrets
 import smtplib
+import threading
+import time
 import unicodedata
 import uuid
+from zipfile import BadZipFile
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from urllib.parse import quote, urlencode
+from pathlib import Path
+from urllib.parse import quote, urlencode, urljoin
 
 import click
 import requests
 from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
-from flask import Flask, jsonify, redirect, request, send_from_directory, session
+from flask import Flask, has_app_context, jsonify, redirect, request, send_from_directory, session
+from flask_socketio import SocketIO, emit, join_room
 from flask_sqlalchemy import SQLAlchemy
+from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 from sqlalchemy import inspect, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
 
-database_url = os.environ.get("DATABASE_URL", "sqlite:///agrocordoba.db")
-if database_url.startswith("postgres://"):
-    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+def _get_database_url():
+    database_url = os.environ.get("DATABASE_URL", "").strip() or "sqlite:///agrocordoba.db"
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    return database_url
+
+
+database_url = _get_database_url()
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config.update(
     SECRET_KEY=os.environ.get("FLASK_SECRET_KEY", ""),
     SQLALCHEMY_DATABASE_URI=database_url,
@@ -41,10 +61,15 @@ app.config.update(
 )
 
 if not app.config["SECRET_KEY"]:
-    raise RuntimeError("Falta FLASK_SECRET_KEY en backend/.env")
+    raise RuntimeError("Falta FLASK_SECRET_KEY en el archivo .env de la raíz del proyecto.")
 
 db = SQLAlchemy(app)
+socketio = SocketIO(app, async_mode="threading")
 oauth = OAuth(app)
+_quotation_presence_lock = threading.Lock()
+_quotation_presence = {}
+_socket_user_ids = {}
+_socket_quotation_ids = {}
 
 google = oauth.register(
     name="google",
@@ -70,6 +95,7 @@ class User(db.Model):
     phone = db.Column(db.String(30), nullable=False, default="")
     farm_name = db.Column(db.String(160), nullable=False, default="")
     association = db.Column(db.String(200), nullable=False, default="")
+    farm_address = db.Column(db.String(500), nullable=False, default="")
     status = db.Column(db.String(20), nullable=False, default="activo")
 
     def to_public_dict(self):
@@ -94,6 +120,11 @@ class User(db.Model):
                 for item in ProducerProduct.query.filter_by(user_id=self.id).order_by(ProducerProduct.id).all()
             ],
         }
+
+    def to_account_dict(self):
+        payload = self.to_public_dict()
+        payload["farmAddress"] = self.farm_address
+        return payload
 
 
 class ProducerProduct(db.Model):
@@ -166,13 +197,21 @@ class ProductListing(db.Model):
 
     def to_public_dict(self):
         producer = db.session.get(User, self.producer_id)
+        product_image = str(self.image or "").strip()
+        if not product_image:
+            product_image = (
+                "/images/yuca-real.jpg"
+                if "yuca" in self.name.casefold()
+                else "/images/field-aerial-1.webp"
+            )
         return {
             **_product_public_fields(self),
             "id": self.id,
+            "image": product_image,
             "producerId": self.producer_id,
             "producerName": producer.name if producer else "Productor AgroCórdoba",
             "producerAssociation": producer.association or "Independiente" if producer else "Independiente",
-            "producerPhoto": producer.avatar if producer else "",
+            "producerPhoto": (producer.avatar or "").strip() or "/images/campesinos-colombia.jpg",
             "producerWhatsapp": "".join(char for char in (producer.phone or "") if char.isdigit()) if producer else "",
         }
 
@@ -209,6 +248,11 @@ class QuotationRecord(db.Model):
     client_city = db.Column(db.String(100), nullable=False, default="")
     quantity_kg = db.Column(db.Float, nullable=False, default=0)
     destination_zone = db.Column(db.String(40), nullable=False, default="")
+    fulfillment_method = db.Column(db.String(20), nullable=False, default="domicilio")
+    delivery_address = db.Column(db.String(500), nullable=False, default="")
+    delivery_latitude = db.Column(db.Float, nullable=True)
+    delivery_longitude = db.Column(db.Float, nullable=True)
+    payment_method = db.Column(db.String(20), nullable=False, default="transferencia")
     freight_cop = db.Column(db.Float, nullable=False, default=0)
     subtotal_cop = db.Column(db.Float, nullable=False, default=0)
     total_cop = db.Column(db.Float, nullable=False, default=0)
@@ -219,7 +263,7 @@ class QuotationRecord(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
     def to_public_dict(self):
-        return {
+        payload = {
             "productId": self.product_id,
             "productName": self.product_name,
             "productVariety": self.product_variety,
@@ -233,6 +277,8 @@ class QuotationRecord(db.Model):
             "clientCity": self.client_city,
             "quantityKg": self.quantity_kg,
             "destinationZone": self.destination_zone,
+            "fulfillmentMethod": self.fulfillment_method,
+            "paymentMethod": self.payment_method,
             "freightCop": self.freight_cop,
             "subtotalCop": self.subtotal_cop,
             "totalCop": self.total_cop,
@@ -244,6 +290,124 @@ class QuotationRecord(db.Model):
             "producerId": self.producer_id,
             "status": self.status,
             "createdAt": self.created_at.isoformat(),
+        }
+        if self.status in {"Acordado", "Listo para recoger", "Entregado", "Cerrado"}:
+            payload.update({
+                "deliveryAddress": self.delivery_address,
+                "deliveryLatitude": self.delivery_latitude,
+                "deliveryLongitude": self.delivery_longitude,
+                "producerPickupAddress": (
+                    db.session.get(User, self.producer_id).farm_address
+                    if self.fulfillment_method == "recoger"
+                    and db.session.get(User, self.producer_id)
+                    else ""
+                ),
+            })
+        return payload
+
+
+class QuotationOffer(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    quotation_id = db.Column(
+        db.String(36), db.ForeignKey("quotation_record.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sender_id = db.Column(db.String(36), db.ForeignKey("user.id"), nullable=False, index=True)
+    sender_name = db.Column(db.String(160), nullable=False)
+    unit_price_cop = db.Column(db.Float, nullable=False)
+    quantity_kg = db.Column(db.Float, nullable=False)
+    freight_cop = db.Column(db.Float, nullable=False, default=0)
+    total_cop = db.Column(db.Float, nullable=False)
+    reference_product = db.Column(db.String(120), nullable=False)
+    reference_price_cop_kg = db.Column(db.Float, nullable=False)
+    reference_market = db.Column(db.String(160), nullable=False)
+    reference_date = db.Column(db.String(80), nullable=False)
+    reference_source_url = db.Column(db.String(500), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default="Pendiente")
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    responded_at = db.Column(db.DateTime(timezone=True), nullable=True)
+
+    def to_public_dict(self):
+        # SIPSA prices are positive; zero marks an offer without an official reference.
+        has_price_reference = self.reference_price_cop_kg > 0
+        return {
+            "id": self.id,
+            "quotationId": self.quotation_id,
+            "senderId": self.sender_id,
+            "senderName": self.sender_name,
+            "unitPriceCop": self.unit_price_cop,
+            "quantityKg": self.quantity_kg,
+            "freightCop": self.freight_cop,
+            "totalCop": self.total_cop,
+            "status": self.status,
+            "createdAt": self.created_at.isoformat(),
+            "respondedAt": self.responded_at.isoformat() if self.responded_at else None,
+            "priceReference": (
+                {
+                    "productName": self.reference_product,
+                    "priceCopKg": self.reference_price_cop_kg,
+                    "market": self.reference_market,
+                    "date": self.reference_date,
+                    "sourceUrl": self.reference_source_url,
+                }
+                if has_price_reference
+                else None
+            ),
+            "priceReferenceUnavailable": (
+                None
+                if has_price_reference
+                else {
+                    "reason": self.reference_market,
+                    "date": self.reference_date,
+                    "sourceUrl": self.reference_source_url,
+                }
+            ),
+        }
+
+
+class SipsaPriceReference(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    product_key = db.Column(db.String(120), nullable=False)
+    product_name = db.Column(db.String(120), nullable=False)
+    market = db.Column(db.String(160), nullable=False)
+    price_cop_kg = db.Column(db.Float, nullable=False)
+    report_date = db.Column(db.Date, nullable=False)
+    report_url = db.Column(db.String(500), nullable=False)
+    __table_args__ = (
+        db.UniqueConstraint(
+            "product_key",
+            "market",
+            "report_date",
+            name="uq_sipsa_price_reference_daily",
+        ),
+        db.Index("ix_sipsa_price_reference_product_date", "product_key", "report_date"),
+    )
+
+
+class QuotationMessage(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    quotation_id = db.Column(
+        db.String(36), db.ForeignKey("quotation_record.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sender_id = db.Column(db.String(36), db.ForeignKey("user.id"), nullable=False, index=True)
+    sender_name = db.Column(db.String(160), nullable=False)
+    content = db.Column(db.String(2000), nullable=False)
+    message_type = db.Column(db.String(20), nullable=False, default="text")
+    offer_id = db.Column(db.String(36), db.ForeignKey("quotation_offer.id", ondelete="SET NULL"), nullable=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    read_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    offer = db.relationship("QuotationOffer")
+
+    def to_public_dict(self):
+        return {
+            "id": self.id,
+            "quotationId": self.quotation_id,
+            "senderId": self.sender_id,
+            "senderName": self.sender_name,
+            "content": self.content,
+            "messageType": self.message_type,
+            "offer": self.offer.to_public_dict() if self.offer else None,
+            "createdAt": self.created_at.isoformat(),
+            "readAt": self.read_at.isoformat() if self.read_at else None,
         }
 
 
@@ -483,6 +647,41 @@ def list_quotations():
     return jsonify({"quotations": [quotation.to_public_dict() for quotation in rows]})
 
 
+def _unread_message_count(user_id, quotation_id):
+    return QuotationMessage.query.filter(
+        QuotationMessage.quotation_id == quotation_id,
+        QuotationMessage.sender_id != user_id,
+        QuotationMessage.read_at.is_(None),
+    ).count()
+
+
+@app.get("/api/notifications/unread-messages")
+def list_unread_message_counts():
+    user = _current_user()
+    if user is None:
+        return jsonify({"error": "Inicia sesión para consultar tus mensajes pendientes."}), 401
+    if user.role not in {"cliente", "productor"}:
+        return jsonify({"error": "Esta cuenta no puede consultar mensajes pendientes."}), 403
+    if user.role == "productor" and user.status != "activo":
+        return jsonify({"error": "Tu cuenta de productor está pendiente de aprobación."}), 403
+
+    quotation_column = (
+        QuotationRecord.client_id if user.role == "cliente" else QuotationRecord.producer_id
+    )
+    rows = (
+        db.session.query(QuotationMessage.quotation_id, db.func.count(QuotationMessage.id))
+        .join(QuotationRecord, QuotationRecord.id == QuotationMessage.quotation_id)
+        .filter(
+            quotation_column == user.id,
+            QuotationMessage.sender_id != user.id,
+            QuotationMessage.read_at.is_(None),
+        )
+        .group_by(QuotationMessage.quotation_id)
+        .all()
+    )
+    return jsonify({"counts": {quotation_id: count for quotation_id, count in rows}})
+
+
 @app.post("/api/quotations")
 def create_quotation():
     user = _current_user()
@@ -511,6 +710,38 @@ def create_quotation():
     destinations = {"Local Córdoba", "Medellín / Antioquia", "Bogotá D.C.", "Costa Caribe", "Internacional"}
     if destination not in destinations:
         return jsonify({"error": "Selecciona un destino válido."}), 400
+    fulfillment_method = str(payload.get("fulfillmentMethod", "domicilio"))
+    if fulfillment_method not in {"domicilio", "recoger"}:
+        return jsonify({"error": "Selecciona domicilio o recoger en el punto de origen."}), 400
+    payment_method = str(payload.get("paymentMethod", "transferencia"))
+    if payment_method not in {"efectivo", "transferencia"}:
+        return jsonify({"error": "Selecciona efectivo o transferencia como forma de pago."}), 400
+    delivery_address = str(payload.get("deliveryAddress", "")).strip()
+    delivery_latitude = payload.get("deliveryLatitude")
+    delivery_longitude = payload.get("deliveryLongitude")
+    if fulfillment_method == "domicilio" and "fulfillmentMethod" in payload and not delivery_address:
+        return jsonify({"error": "Indica la dirección de entrega para solicitar domicilio."}), 400
+    if len(delivery_address) > 500:
+        return jsonify({"error": "La dirección de entrega no puede superar 500 caracteres."}), 400
+    if (delivery_latitude is None) != (delivery_longitude is None):
+        return jsonify({"error": "La ubicación debe incluir latitud y longitud."}), 400
+    if delivery_latitude is not None:
+        try:
+            delivery_latitude = float(delivery_latitude)
+            delivery_longitude = float(delivery_longitude)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Las coordenadas de entrega no son válidas."}), 400
+        if (
+            not math.isfinite(delivery_latitude)
+            or not math.isfinite(delivery_longitude)
+            or not -90 <= delivery_latitude <= 90
+            or not -180 <= delivery_longitude <= 180
+        ):
+            return jsonify({"error": "Las coordenadas de entrega están fuera de rango."}), 400
+    if fulfillment_method == "recoger":
+        delivery_address = ""
+        delivery_latitude = None
+        delivery_longitude = None
     discount = 10 if quantity >= 5000 else 7 if quantity >= 2000 else 4 if quantity >= 500 else 0
     subtotal = quantity * product["priceCopKg"] * (1 - discount / 100)
     total = subtotal + freight
@@ -532,6 +763,11 @@ def create_quotation():
         client_city=user.city,
         quantity_kg=quantity,
         destination_zone=destination,
+        fulfillment_method=fulfillment_method,
+        delivery_address=delivery_address,
+        delivery_latitude=delivery_latitude,
+        delivery_longitude=delivery_longitude,
+        payment_method=payment_method,
         freight_cop=freight,
         subtotal_cop=subtotal,
         total_cop=total,
@@ -541,7 +777,9 @@ def create_quotation():
     )
     db.session.add(quotation)
     db.session.commit()
-    return jsonify({"quotation": quotation.to_public_dict()}), 201
+    public_quotation = quotation.to_public_dict()
+    _emit_quotation_update(public_quotation)
+    return jsonify({"quotation": public_quotation}), 201
 
 
 @app.patch("/api/quotations/<string:quotation_id>")
@@ -549,22 +787,544 @@ def update_quotation_status(quotation_id):
     user = _current_user()
     if user is None:
         return jsonify({"error": "Inicia sesión para actualizar la cotización."}), 401
-    if user.role != "productor":
-        return jsonify({"error": "Solo el productor puede actualizar el estado."}), 403
-    if user.status != "activo":
+    if user.role not in {"productor", "cliente"}:
+        return jsonify({"error": "Esta cuenta no puede actualizar el estado de la cotización."}), 403
+    if user.role == "productor" and user.status != "activo":
         return jsonify({"error": "Tu cuenta no está aprobada para gestionar cotizaciones."}), 403
     quotation = db.session.get(QuotationRecord, quotation_id)
     if quotation is None:
         return jsonify({"error": "No se encontró la cotización."}), 404
-    if quotation.producer_id != user.id:
+    if user.id not in {quotation.client_id, quotation.producer_id}:
         return jsonify({"error": "No tienes permiso para cambiar esta cotización."}), 403
     payload = request.get_json(silent=True) or {}
     status = str(payload.get("status", ""))
-    if status not in {"Pendiente", "Cotizado", "Contactado WhatsApp", "Cerrado"}:
-        return jsonify({"error": "El estado indicado no es válido."}), 400
+    if user.id == quotation.producer_id:
+        if status in {"Cotizado", "Contactado WhatsApp"}:
+            if quotation.status not in {"Pendiente", "Cotizado", "Contactado WhatsApp", "En negociación"}:
+                return jsonify({"error": "Esta cotización ya no está en negociación."}), 409
+        elif status == "Entregado" and quotation.fulfillment_method == "domicilio":
+            if quotation.status != "Acordado":
+                return jsonify({"error": "Solo puedes marcar como entregado un pedido acordado."}), 409
+        elif status == "Listo para recoger" and quotation.fulfillment_method == "recoger":
+            if quotation.status != "Acordado":
+                return jsonify({"error": "Solo puedes preparar para recoger un pedido acordado."}), 409
+            producer = db.session.get(User, quotation.producer_id)
+            if not producer or not producer.farm_address.strip():
+                return jsonify({"error": "Completa la dirección privada de recogida en la configuración de tu cuenta."}), 400
+        else:
+            return jsonify({"error": "El estado solicitado no corresponde a una acción del productor."}), 400
+    else:
+        if status != "Cerrado" or quotation.status not in {"Entregado", "Listo para recoger"}:
+            return jsonify({"error": "Solo puedes cerrar el pedido después de que el producto esté entregado o listo para recoger."}), 409
+        if quotation.status == "Listo para recoger" and quotation.fulfillment_method != "recoger":
+            return jsonify({"error": "Este pedido no está configurado para recogida."}), 409
     quotation.status = status
     db.session.commit()
-    return jsonify({"quotation": quotation.to_public_dict()})
+    public_quotation = quotation.to_public_dict()
+    _emit_quotation_update(public_quotation)
+    return jsonify({"quotation": public_quotation})
+
+
+def _delete_account_data(account):
+    quotation_ids = [
+        row[0]
+        for row in db.session.query(QuotationRecord.id).filter(
+            (QuotationRecord.client_id == account.id) | (QuotationRecord.producer_id == account.id)
+        )
+    ]
+    listing_ids = [
+        row[0]
+        for row in db.session.query(ProductListing.id).filter_by(producer_id=account.id)
+    ]
+
+    ProducerProduct.query.filter_by(user_id=account.id).delete(synchronize_session=False)
+    Favorite.query.filter_by(user_id=account.id).delete(synchronize_session=False)
+    ReadNotification.query.filter_by(user_id=account.id).delete(synchronize_session=False)
+    AccountSettings.query.filter_by(user_id=account.id).delete(synchronize_session=False)
+    SettingsVerification.query.filter_by(user_id=account.id).delete(synchronize_session=False)
+    PasswordResetVerification.query.filter_by(user_id=account.id).delete(synchronize_session=False)
+    if quotation_ids:
+        ReadNotification.query.filter(ReadNotification.quotation_id.in_(quotation_ids)).delete(
+            synchronize_session=False
+        )
+        QuotationOffer.query.filter(QuotationOffer.quotation_id.in_(quotation_ids)).delete(
+            synchronize_session=False
+        )
+        QuotationMessage.query.filter(QuotationMessage.quotation_id.in_(quotation_ids)).delete(
+            synchronize_session=False
+        )
+        QuotationRecord.query.filter(QuotationRecord.id.in_(quotation_ids)).delete(
+            synchronize_session=False
+        )
+    if listing_ids:
+        ProductCertification.query.filter(ProductCertification.product_id.in_(listing_ids)).delete(
+            synchronize_session=False
+        )
+        ProductListing.query.filter(ProductListing.id.in_(listing_ids)).delete(
+            synchronize_session=False
+        )
+
+    db.session.delete(account)
+
+
+@app.delete("/api/account")
+def delete_own_account():
+    account = _current_user()
+    if account is None:
+        return jsonify({"error": "Inicia sesión para eliminar tu cuenta."}), 401
+    if account.role not in {"cliente", "productor"}:
+        return jsonify({"error": "Solo los clientes y productores pueden eliminar su cuenta desde aquí."}), 403
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Confirma tu correo y la eliminación de la cuenta."}), 400
+    if str(payload.get("email", "")).strip().casefold() != account.email.casefold():
+        return jsonify({"error": "El correo no coincide con la cuenta iniciada."}), 400
+    if payload.get("confirmation") != "ELIMINAR MI CUENTA":
+        return jsonify({"error": "Escribe ELIMINAR MI CUENTA para confirmar la acción."}), 400
+
+    password = str(payload.get("currentPassword", ""))
+    if account.password_hash:
+        if not password or not check_password_hash(account.password_hash, password):
+            return jsonify({"error": "La contraseña actual no es correcta."}), 400
+    elif account.google_sub.startswith("local:"):
+        return jsonify({"error": "No se puede verificar la identidad de esta cuenta local."}), 400
+
+    _delete_account_data(account)
+    db.session.commit()
+    session.clear()
+    return jsonify({"ok": True})
+
+
+DANE_SIPSA_PAGE_URL = (
+    "https://www.dane.gov.co/index.php/estadisticas-por-tema/agropecuario/"
+    "sistema-de-informacion-de-precios-sipsa/componente-precios-mayoristas"
+)
+DANE_SIPSA_SOURCE_URL = "https://www.dane.gov.co"
+SIPSA_CACHE_SECONDS = 3600
+_sipsa_cache_lock = threading.Lock()
+_sipsa_cache = {"expires_at": 0.0, "rows": [], "report_date": "", "report_url": ""}
+SPANISH_MONTHS = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+}
+SPANISH_MONTH_ABBREVIATIONS = {
+    "ene": 1,
+    "feb": 2,
+    "mar": 3,
+    "abr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "ago": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dic": 12,
+}
+
+
+def _parse_open_data_date(value):
+    normalized = unicodedata.normalize("NFD", str(value).casefold())
+    normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
+    match = re.search(r"\b(\d{1,2}) de ([a-z]+) de (\d{4})\b", normalized)
+    if not match:
+        return None
+    month = SPANISH_MONTHS.get(match.group(2))
+    if not month:
+        return None
+    try:
+        return datetime(int(match.group(3)), month, int(match.group(1)))
+    except ValueError:
+        return None
+
+
+def _normalize_price_product(value):
+    normalized = unicodedata.normalize("NFD", str(value).casefold())
+    normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
+    return re.sub(r"[^a-z0-9 ]", " ", normalized).strip()
+
+
+def _latest_sipsa_report_url(links):
+    dated_links = []
+    for link in links:
+        match = re.search(r"anex-SIPSADiario-(\d{1,2})([a-z]{3})(\d{4})\.xlsx$", link, re.IGNORECASE)
+        if not match:
+            continue
+        month = SPANISH_MONTH_ABBREVIATIONS.get(match.group(2).lower())
+        if not month:
+            continue
+        try:
+            report_date = datetime(int(match.group(3)), month, int(match.group(1)))
+        except ValueError:
+            continue
+        dated_links.append((report_date, link))
+    if not dated_links:
+        raise ValueError("La página de DANE no publicó un anexo diario SIPSA con fecha reconocible.")
+    return urljoin(DANE_SIPSA_PAGE_URL, max(dated_links, key=lambda item: item[0])[1])
+
+
+def _fetch_latest_sipsa_report():
+    page_response = requests.get(DANE_SIPSA_PAGE_URL, timeout=(3, 10))
+    page_response.raise_for_status()
+    links = re.findall(
+        r"""href=["']([^"']*?/files/operaciones/SIPSA/anex-SIPSADiario-[^"']+\.xlsx)["']""",
+        page_response.text,
+        flags=re.IGNORECASE,
+    )
+    if not links:
+        raise ValueError("La página de DANE no publicó un anexo diario SIPSA.")
+    report_url = _latest_sipsa_report_url(links)
+    report_response = requests.get(report_url, timeout=(3, 20))
+    report_response.raise_for_status()
+    workbook = load_workbook(io.BytesIO(report_response.content), read_only=True, data_only=True)
+    try:
+        sheet = workbook.active
+        title = str(sheet["A2"].value or "")
+        report_date = _parse_open_data_date(title)
+        if report_date is None:
+            raise ValueError("El anexo diario SIPSA no contiene una fecha reconocible.")
+        markets = next(sheet.iter_rows(min_row=3, max_row=3, values_only=True))
+        rows = []
+        for values in sheet.iter_rows(min_row=5, values_only=True):
+            product_name = str(values[0] or "").strip().rstrip("*").strip() if values else ""
+            if not product_name:
+                continue
+            for price_column in range(1, len(values), 2):
+                market = str(markets[price_column] or "").replace("\n", " ").strip()
+                if not market:
+                    continue
+                price = values[price_column]
+                try:
+                    price = float(price)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(price) or price <= 0:
+                    continue
+                rows.append(
+                    {
+                        "productName": product_name,
+                        "market": market,
+                        "priceCopKg": price,
+                        "date": report_date.strftime("%Y-%m-%d"),
+                        "reportUrl": report_url,
+                    }
+                )
+        return rows, report_date.strftime("%Y-%m-%d"), report_url
+    finally:
+        workbook.close()
+
+
+def _get_latest_sipsa_rows():
+    now = time.monotonic()
+    if now < _sipsa_cache["expires_at"]:
+        return _sipsa_cache["rows"], _sipsa_cache["report_date"], _sipsa_cache["report_url"]
+    with _sipsa_cache_lock:
+        now = time.monotonic()
+        if now < _sipsa_cache["expires_at"]:
+            return _sipsa_cache["rows"], _sipsa_cache["report_date"], _sipsa_cache["report_url"]
+        rows, report_date, report_url = _fetch_latest_sipsa_report()
+        _sipsa_cache.update(
+            rows=rows,
+            report_date=report_date,
+            report_url=report_url,
+            expires_at=time.monotonic() + SIPSA_CACHE_SECONDS,
+        )
+        return rows, report_date, report_url
+
+
+def _price_reference_items(rows, product):
+    normalized_query = _normalize_price_product(product)
+    exact_matches = [
+        row for row in rows
+        if _normalize_price_product(row["productName"]) == normalized_query
+    ]
+    if exact_matches:
+        matched_rows = exact_matches
+    else:
+        query_root = normalized_query.split(" ", 1)[0]
+        matched_rows = [
+            row for row in rows
+            if _normalize_price_product(row["productName"]).split(" ", 1)[0] == query_root
+        ]
+    matched_rows.sort(
+        key=lambda row: (
+            0 if "monteria" in _normalize_price_product(row["market"]) else 1,
+            row["productName"],
+            row["market"],
+        )
+    )
+    references = [
+        {
+            "productName": row["productName"],
+            "market": row["market"],
+            "city": row["market"].split(",", 1)[0],
+            "meanPriceCop": row["priceCopKg"],
+            "date": row["date"],
+        }
+        for row in matched_rows[:10]
+    ]
+    return references
+
+
+def _persist_sipsa_report(rows, report_date, report_url, force=False):
+    parsed_report_date = datetime.strptime(report_date, "%Y-%m-%d").date()
+    existing_report = SipsaPriceReference.query.filter_by(
+        report_date=parsed_report_date,
+        report_url=report_url,
+    ).first()
+    if existing_report and not force:
+        return 0
+
+    records = {}
+    for row in rows:
+        product_name = str(row.get("productName", "")).strip()
+        market = str(row.get("market", "")).strip()
+        product_key = _normalize_price_product(product_name)
+        try:
+            price = float(row.get("priceCopKg"))
+        except (TypeError, ValueError):
+            continue
+        if not product_key or not market or not math.isfinite(price) or price <= 0:
+            continue
+        records[(product_key, market, parsed_report_date)] = {
+            "product_key": product_key,
+            "product_name": product_name,
+            "market": market,
+            "price_cop_kg": price,
+            "report_date": parsed_report_date,
+            "report_url": report_url,
+        }
+
+    if not records:
+        raise ValueError("El anexo SIPSA no contiene referencias de precios válidas.")
+
+    values = list(records.values())
+    dialect = db.engine.dialect.name
+    if dialect == "postgresql":
+        statement = postgresql_insert(SipsaPriceReference).values(values)
+    elif dialect == "sqlite":
+        statement = sqlite_insert(SipsaPriceReference).values(values)
+    else:
+        for value in values:
+            existing = SipsaPriceReference.query.filter_by(
+                product_key=value["product_key"],
+                market=value["market"],
+                report_date=value["report_date"],
+            ).first()
+            if existing is None:
+                db.session.add(SipsaPriceReference(**value))
+            else:
+                for key, item in value.items():
+                    setattr(existing, key, item)
+        db.session.commit()
+        return len(values)
+
+    statement = statement.on_conflict_do_update(
+        index_elements=["product_key", "market", "report_date"],
+        set_={
+            "product_name": statement.excluded.product_name,
+            "price_cop_kg": statement.excluded.price_cop_kg,
+            "report_url": statement.excluded.report_url,
+        },
+    )
+    db.session.execute(statement)
+    db.session.commit()
+    return len(values)
+
+
+def _saved_sipsa_price_references(product):
+    normalized_query = _normalize_price_product(product)
+    query_root = normalized_query.split(" ", 1)[0]
+    saved_rows = (
+        SipsaPriceReference.query.filter(
+            SipsaPriceReference.product_key.in_({normalized_query, query_root})
+        )
+        .order_by(SipsaPriceReference.report_date.desc())
+        .all()
+    )
+    exact_matches = [row for row in saved_rows if row.product_key == normalized_query]
+    matched_rows = exact_matches or [
+        row for row in saved_rows if row.product_key.split(" ", 1)[0] == query_root
+    ]
+    if not matched_rows:
+        return [], "", ""
+
+    latest_date = max(row.report_date for row in matched_rows)
+    matched_rows = [row for row in matched_rows if row.report_date == latest_date]
+    matched_rows.sort(
+        key=lambda row: (
+            0 if "monteria" in _normalize_price_product(row.market) else 1,
+            row.product_name,
+            row.market,
+        )
+    )
+    references = [
+        {
+            "productName": row.product_name,
+            "market": row.market,
+            "city": row.market.split(",", 1)[0],
+            "meanPriceCop": row.price_cop_kg,
+            "date": row.report_date.isoformat(),
+        }
+        for row in matched_rows[:10]
+    ]
+    return references, latest_date.isoformat(), matched_rows[0].report_url
+
+
+def _get_sipsa_price_references(product):
+    rows, report_date, report_url = _get_latest_sipsa_rows()
+    if has_app_context() and rows:
+        _persist_sipsa_report(rows, report_date, report_url)
+    references = _price_reference_items(rows, product)
+    return references, report_date, report_url
+
+
+def _official_price_snapshot(product):
+    references, report_date, report_url = _get_sipsa_price_references(product)
+    if not references:
+        return None, report_date, report_url
+    return references[0], report_date, report_url
+
+
+def _sipsa_source_metadata():
+    return {
+        "name": "DANE — SIPSA, boletín diario de precios mayoristas",
+        "datasetUrl": DANE_SIPSA_PAGE_URL,
+        "coverage": "Mercados mayoristas cubiertos por SIPSA, incluido Montería cuando hay dato para el producto.",
+        "unit": "COP/kg",
+    }
+
+
+def _price_reference_payload(product, references, report_date, report_url, fallback=False):
+    return {
+        "product": product,
+        "references": references,
+        "reportDate": report_date,
+        "reportUrl": report_url,
+        "source": _sipsa_source_metadata(),
+        "fallbackToStoredData": fallback,
+    }
+
+
+@app.get("/api/price-references")
+def list_price_references():
+    product = str(request.args.get("product", "")).strip()
+    if not product or len(product) > 120:
+        return jsonify({"error": "Indica un producto válido para consultar el precio de referencia."}), 400
+    try:
+        references, report_date, report_url = _get_sipsa_price_references(product)
+    except (requests.RequestException, ValueError, OSError, BadZipFile, InvalidFileException) as error:
+        app.logger.warning("No se pudo consultar el anexo oficial de precios SIPSA: %s", error)
+        try:
+            references, report_date, report_url = _saved_sipsa_price_references(product)
+        except SQLAlchemyError as database_error:
+            db.session.rollback()
+            app.logger.error("No se pudo leer la referencia SIPSA guardada: %s", database_error)
+            return jsonify({"error": "No fue posible leer la referencia SIPSA guardada."}), 503
+        if not references:
+            return jsonify({"error": "No se pudo consultar el precio mayorista oficial del DANE y no hay datos guardados."}), 502
+        return jsonify(_price_reference_payload(product, references, report_date, report_url, fallback=True))
+    except SQLAlchemyError as error:
+        db.session.rollback()
+        app.logger.error("No se pudo guardar la referencia SIPSA: %s", error)
+        return jsonify({"error": "No fue posible consultar y guardar la referencia SIPSA."}), 503
+    return jsonify(_price_reference_payload(product, references, report_date, report_url))
+
+
+@app.get("/api/price-references/batch")
+def list_price_references_batch():
+    products = list(dict.fromkeys(str(value).strip() for value in request.args.getlist("product")))
+    if not products or len(products) > 50 or any(not product or len(product) > 120 for product in products):
+        return jsonify({"error": "Indica entre 1 y 50 nombres de producto válidos."}), 400
+
+    try:
+        rows, report_date, report_url = _get_latest_sipsa_rows()
+        if rows:
+            _persist_sipsa_report(rows, report_date, report_url)
+        results = {
+            product: _price_reference_payload(
+                product,
+                _price_reference_items(rows, product),
+                report_date,
+                report_url,
+            )
+            for product in products
+        }
+        return jsonify({"referencesByProduct": results})
+    except (requests.RequestException, ValueError, OSError, BadZipFile, InvalidFileException) as error:
+        app.logger.warning("No se pudo consultar el anexo oficial de precios SIPSA: %s", error)
+        results = {}
+        try:
+            for product in products:
+                references, report_date, report_url = _saved_sipsa_price_references(product)
+                results[product] = _price_reference_payload(
+                    product,
+                    references,
+                    report_date,
+                    report_url,
+                    fallback=bool(references),
+                )
+        except SQLAlchemyError as database_error:
+            db.session.rollback()
+            app.logger.error("No se pudieron leer referencias SIPSA guardadas: %s", database_error)
+            return jsonify({"error": "No fue posible leer las referencias SIPSA guardadas."}), 503
+        if not any(result["references"] for result in results.values()):
+            return jsonify({"error": "No se pudo consultar el precio SIPSA y no hay datos guardados."}), 502
+        return jsonify({"referencesByProduct": results})
+    except SQLAlchemyError as error:
+        db.session.rollback()
+        app.logger.error("No se pudo guardar la referencia SIPSA por lote: %s", error)
+        return jsonify({"error": "No fue posible consultar y guardar las referencias SIPSA."}), 503
+
+
+@app.post("/api/tasks/price-references/refresh")
+def refresh_price_references():
+    expected_token = os.environ.get("SIPSA_TASK_TOKEN", "").strip()
+    if not expected_token:
+        return jsonify({"error": "La tarea diaria SIPSA no está configurada."}), 503
+    supplied_token = request.headers.get("Authorization", "")
+    if not hmac.compare_digest(
+        supplied_token.encode("utf-8"),
+        f"Bearer {expected_token}".encode("utf-8"),
+    ):
+        return jsonify({"error": "No tienes autorización para ejecutar esta tarea."}), 403
+    try:
+        rows, report_date, report_url = _fetch_latest_sipsa_report()
+        stored_count = _persist_sipsa_report(rows, report_date, report_url, force=True)
+    except (requests.RequestException, ValueError, OSError, BadZipFile, InvalidFileException) as error:
+        app.logger.error("Falló la actualización programada SIPSA: %s", error)
+        return jsonify({"error": "No fue posible actualizar las referencias SIPSA desde el DANE."}), 502
+    except SQLAlchemyError as error:
+        db.session.rollback()
+        app.logger.error("No se pudieron persistir las referencias SIPSA: %s", error)
+        return jsonify({"error": "No fue posible guardar las referencias SIPSA."}), 503
+
+    _sipsa_cache.update(
+        rows=rows,
+        report_date=report_date,
+        report_url=report_url,
+        expires_at=time.monotonic() + SIPSA_CACHE_SECONDS,
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "reportDate": report_date,
+            "reportUrl": report_url,
+            "storedRows": stored_count,
+        }
+    )
 
 
 @app.get("/api/favorites")
@@ -720,16 +1480,7 @@ def admin_delete_user(user_id):
     account = db.session.get(User, user_id)
     if account is None or account.role == "admin":
         return jsonify({"error": "No se encontró la cuenta que deseas eliminar."}), 404
-    QuotationRecord.query.filter(
-        (QuotationRecord.client_id == account.id) | (QuotationRecord.producer_id == account.id)
-    ).delete(synchronize_session=False)
-    ProductListing.query.filter_by(producer_id=account.id).delete(synchronize_session=False)
-    Favorite.query.filter_by(user_id=account.id).delete(synchronize_session=False)
-    ReadNotification.query.filter_by(user_id=account.id).delete(synchronize_session=False)
-    AccountSettings.query.filter_by(user_id=account.id).delete(synchronize_session=False)
-    SettingsVerification.query.filter_by(user_id=account.id).delete(synchronize_session=False)
-    PasswordResetVerification.query.filter_by(user_id=account.id).delete(synchronize_session=False)
-    db.session.delete(account)
+    _delete_account_data(account)
     db.session.commit()
     return jsonify({"ok": True})
 
@@ -744,8 +1495,396 @@ def _current_user():
     return user
 
 
+def _user_can_access_quotation(user, quotation):
+    if user is None or quotation is None:
+        return False
+    if user.role == "productor" and user.status != "activo":
+        return False
+    return user.id in {quotation.client_id, quotation.producer_id}
+
+
+def _quotation_peer_id(quotation, user_id):
+    return quotation.producer_id if quotation.client_id == user_id else quotation.client_id
+
+
+def _quotation_peer_is_online(quotation_id, user_id):
+    with _quotation_presence_lock:
+        return bool(_quotation_presence.get(quotation_id, {}).get(user_id))
+
+
+def _socket_is_in_quotation(sid, quotation_id):
+    with _quotation_presence_lock:
+        return quotation_id in _socket_quotation_ids.get(sid, set())
+
+
+@socketio.on("connect")
+def handle_socket_connect(auth=None):
+    user = _current_user()
+    if user is None or user.role not in {"cliente", "productor"}:
+        return False
+    if user.role == "productor" and user.status != "activo":
+        return False
+    join_room(f"user:{user.id}")
+    with _quotation_presence_lock:
+        _socket_user_ids[request.sid] = user.id
+    return True
+
+
+@socketio.on("disconnect")
+def handle_socket_disconnect(reason=None):
+    sid = request.sid
+    with _quotation_presence_lock:
+        user_id = _socket_user_ids.pop(sid, None)
+        quotation_ids = _socket_quotation_ids.pop(sid, set())
+        offline_rooms = []
+        if user_id:
+            for quotation_id in quotation_ids:
+                participants = _quotation_presence.get(quotation_id, {})
+                sockets = participants.get(user_id, set())
+                sockets.discard(sid)
+                if not sockets:
+                    participants.pop(user_id, None)
+                    offline_rooms.append(quotation_id)
+                if not participants:
+                    _quotation_presence.pop(quotation_id, None)
+    for quotation_id in offline_rooms:
+        socketio.emit(
+            "quotation:presence",
+            {"userId": user_id, "online": False},
+            to=f"quotation:{quotation_id}",
+        )
+
+
+@socketio.on("quotation:join")
+def handle_quotation_join(payload):
+    user = _current_user()
+    quotation_id = str(payload.get("quotationId", "")) if isinstance(payload, dict) else ""
+    quotation = db.session.get(QuotationRecord, quotation_id)
+    if not _user_can_access_quotation(user, quotation):
+        return {"ok": False, "error": "No tienes permiso para consultar esta conversación."}
+    room = f"quotation:{quotation.id}"
+    join_room(room)
+    sid = request.sid
+    peer_id = _quotation_peer_id(quotation, user.id)
+    with _quotation_presence_lock:
+        participants = _quotation_presence.setdefault(quotation.id, {})
+        participants.setdefault(user.id, set()).add(sid)
+        _socket_quotation_ids.setdefault(sid, set()).add(quotation.id)
+        peer_online = bool(participants.get(peer_id))
+
+    unread_messages = QuotationMessage.query.filter(
+        QuotationMessage.quotation_id == quotation.id,
+        QuotationMessage.sender_id != user.id,
+        QuotationMessage.read_at.is_(None),
+    ).all()
+    read_at = datetime.now(timezone.utc)
+    for message in unread_messages:
+        message.read_at = read_at
+    if unread_messages:
+        db.session.commit()
+        socketio.emit(
+            "quotation:unread",
+            {"quotationId": quotation.id, "count": _unread_message_count(user.id, quotation.id)},
+            to=f"user:{user.id}",
+        )
+        emit(
+            "quotation:read",
+            {
+                "messageIds": [message.id for message in unread_messages],
+                "readerId": user.id,
+                "readAt": read_at.isoformat(),
+            },
+            to=room,
+        )
+    emit(
+        "quotation:presence",
+        {"userId": user.id, "online": True},
+        to=room,
+        include_self=False,
+    )
+    messages = (
+        QuotationMessage.query.filter_by(quotation_id=quotation.id)
+        .order_by(QuotationMessage.created_at.desc())
+        .all()
+    )
+    return {
+        "ok": True,
+        "messages": [message.to_public_dict() for message in reversed(messages)],
+        "participantOnline": peer_online,
+    }
+
+
+@socketio.on("quotation:typing")
+def handle_quotation_typing(payload):
+    user = _current_user()
+    quotation_id = str(payload.get("quotationId", "")) if isinstance(payload, dict) else ""
+    quotation = db.session.get(QuotationRecord, quotation_id)
+    if not _user_can_access_quotation(user, quotation):
+        return {"ok": False, "error": "No tienes permiso para participar en esta conversación."}
+    if not _socket_is_in_quotation(request.sid, quotation.id):
+        return {"ok": False, "error": "Únete a la conversación antes de enviar este evento."}
+    emit(
+        "quotation:typing",
+        {"userId": user.id, "typing": bool(payload.get("typing"))},
+        to=f"quotation:{quotation.id}",
+        include_self=False,
+    )
+    return {"ok": True}
+
+
+@socketio.on("quotation:send")
+def handle_quotation_send(payload):
+    user = _current_user()
+    quotation_id = str(payload.get("quotationId", "")) if isinstance(payload, dict) else ""
+    content = str(payload.get("content", "")).strip() if isinstance(payload, dict) else ""
+    quotation = db.session.get(QuotationRecord, quotation_id)
+    if not _user_can_access_quotation(user, quotation):
+        return {"ok": False, "error": "No tienes permiso para escribir en esta conversación."}
+    if not content or len(content) > 2000:
+        return {"ok": False, "error": "El mensaje debe tener entre 1 y 2000 caracteres."}
+    message = QuotationMessage(
+        quotation_id=quotation.id,
+        sender_id=user.id,
+        sender_name=user.name,
+        content=content,
+    )
+    if _quotation_peer_is_online(quotation.id, _quotation_peer_id(quotation, user.id)):
+        message.read_at = datetime.now(timezone.utc)
+    db.session.add(message)
+    db.session.commit()
+    public_message = message.to_public_dict()
+    emit("quotation:message", public_message, to=f"quotation:{quotation.id}")
+    peer_id = _quotation_peer_id(quotation, user.id)
+    socketio.emit(
+        "quotation:unread",
+        {
+            "quotationId": quotation.id,
+            "count": _unread_message_count(peer_id, quotation.id),
+        },
+        to=f"user:{peer_id}",
+    )
+    return {"ok": True, "message": public_message}
+
+
+@socketio.on("quotation:offer")
+def handle_quotation_offer(payload):
+    user = _current_user()
+    quotation_id = str(payload.get("quotationId", "")) if isinstance(payload, dict) else ""
+    quotation = (
+        QuotationRecord.query.filter_by(id=quotation_id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if not _user_can_access_quotation(user, quotation):
+        return {"ok": False, "error": "No tienes permiso para ofertar en esta cotización."}
+    if quotation.status in {"Acordado", "Cerrado"}:
+        return {"ok": False, "error": "Esta cotización ya tiene un acuerdo o está cerrada."}
+    try:
+        unit_price = float(payload.get("unitPriceCop", 0))
+        quantity = float(payload.get("quantityKg", 0))
+        freight = float(payload.get("freightCop", 0))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "El precio, la cantidad o el transporte no son válidos."}
+    if (
+        not all(math.isfinite(value) for value in (unit_price, quantity, freight))
+        or unit_price <= 0
+        or unit_price > 1_000_000_000
+        or quantity <= 0
+        or quantity > 1_000_000
+        or freight < 0
+        or freight > 100_000_000
+    ):
+        return {"ok": False, "error": "El precio, la cantidad o el transporte están fuera del rango permitido."}
+    total = unit_price * quantity + freight
+    if not math.isfinite(total) or total > 1_000_000_000_000:
+        return {"ok": False, "error": "El valor total de la oferta supera el límite permitido."}
+
+    pending_offer = (
+        QuotationOffer.query.filter_by(quotation_id=quotation.id, status="Pendiente")
+        .order_by(QuotationOffer.created_at.desc())
+        .with_for_update()
+        .first()
+    )
+    if pending_offer and pending_offer.sender_id == user.id:
+        return {"ok": False, "error": "Espera a que la otra parte responda antes de enviar otra oferta."}
+    reference_issue = ""
+    try:
+        reference, report_date, report_url = _official_price_snapshot(quotation.product_name)
+    except (requests.RequestException, ValueError, OSError) as error:
+        app.logger.warning("No se pudo obtener el precio SIPSA para la oferta: %s", error)
+        reference = None
+        report_date = ""
+        report_url = DANE_SIPSA_PAGE_URL
+        reference_issue = "No se pudo consultar el boletín oficial DANE-SIPSA al crear esta oferta."
+    if reference is None:
+        if not reference_issue:
+            reference_issue = (
+                f"El boletín oficial DANE-SIPSA del {report_date or 'último día publicado'} "
+                f"no tiene un precio comparable para {quotation.product_name}."
+            )
+
+    now = datetime.now(timezone.utc)
+    if pending_offer:
+        pending_offer.status = "Contraofertada"
+        pending_offer.responded_at = now
+        quotation.status = "En negociación"
+    elif user.role == "productor" and quotation.status == "Pendiente":
+        quotation.status = "Cotizado"
+    else:
+        quotation.status = "En negociación"
+
+    offer = QuotationOffer(
+        quotation_id=quotation.id,
+        sender_id=user.id,
+        sender_name=user.name,
+        unit_price_cop=unit_price,
+        quantity_kg=quantity,
+        freight_cop=freight,
+        total_cop=total,
+        reference_product=reference["productName"] if reference else quotation.product_name,
+        reference_price_cop_kg=reference["meanPriceCop"] if reference else 0,
+        reference_market=reference["market"] if reference else reference_issue,
+        reference_date=reference["date"] if reference else report_date,
+        reference_source_url=report_url or DANE_SIPSA_PAGE_URL,
+    )
+    db.session.add(offer)
+    db.session.flush()
+    message = QuotationMessage(
+        quotation_id=quotation.id,
+        sender_id=user.id,
+        sender_name=user.name,
+        content=f"Oferta: ${unit_price:,.0f}/kg por {quantity:,.0f} kg; total ${total:,.0f} COP.",
+        message_type="offer",
+        offer_id=offer.id,
+    )
+    if _quotation_peer_is_online(quotation.id, _quotation_peer_id(quotation, user.id)):
+        message.read_at = datetime.now(timezone.utc)
+    db.session.add(message)
+    db.session.commit()
+
+    if pending_offer:
+        previous_message_id = (
+            QuotationMessage.query.filter_by(offer_id=pending_offer.id)
+            .order_by(QuotationMessage.created_at.desc())
+            .with_entities(QuotationMessage.id)
+            .scalar()
+        )
+        emit(
+            "quotation:offer:updated",
+            {
+                "messageId": previous_message_id,
+                "offer": pending_offer.to_public_dict(),
+                "quotation": quotation.to_public_dict(),
+            },
+            to=f"quotation:{quotation.id}",
+        )
+    public_message = message.to_public_dict()
+    public_quotation = quotation.to_public_dict()
+    emit("quotation:message", public_message, to=f"quotation:{quotation.id}")
+    peer_id = _quotation_peer_id(quotation, user.id)
+    socketio.emit(
+        "quotation:unread",
+        {
+            "quotationId": quotation.id,
+            "count": _unread_message_count(peer_id, quotation.id),
+        },
+        to=f"user:{peer_id}",
+    )
+    _emit_quotation_update(public_quotation)
+    return {"ok": True, "message": public_message, "quotation": public_quotation}
+
+
+@socketio.on("quotation:offer:respond")
+def handle_quotation_offer_response(payload):
+    user = _current_user()
+    offer_id = str(payload.get("offerId", "")) if isinstance(payload, dict) else ""
+    action = str(payload.get("action", "")) if isinstance(payload, dict) else ""
+    offer = db.session.get(QuotationOffer, offer_id)
+    quotation = (
+        QuotationRecord.query.filter_by(id=offer.quotation_id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+        if offer
+        else None
+    )
+    if not _user_can_access_quotation(user, quotation):
+        return {"ok": False, "error": "No tienes permiso para responder esta oferta."}
+    offer = (
+        QuotationOffer.query.filter_by(id=offer_id, quotation_id=quotation.id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if offer is None:
+        return {"ok": False, "error": "Esta oferta ya no está disponible."}
+    if quotation.status in {"Acordado", "Cerrado"} or offer.status != "Pendiente":
+        return {"ok": False, "error": "Esta oferta ya no está pendiente de respuesta."}
+    if offer.sender_id == user.id:
+        return {"ok": False, "error": "Solo la otra parte puede aceptar o rechazar esta oferta."}
+    if action not in {"accept", "reject"}:
+        return {"ok": False, "error": "La respuesta debe ser aceptar o rechazar."}
+    offer.status = "Aceptada" if action == "accept" else "Rechazada"
+    responded_at = datetime.now(timezone.utc)
+    offer.responded_at = responded_at
+    quotation.status = "Acordado" if action == "accept" else "En negociación"
+    invalidated_offers = []
+    if action == "accept":
+        quotation.quantity_kg = offer.quantity_kg
+        quotation.subtotal_cop = offer.unit_price_cop * offer.quantity_kg
+        quotation.freight_cop = offer.freight_cop
+        quotation.total_cop = offer.total_cop
+        quotation.discount_percent = 0
+        invalidated_offers = (
+            QuotationOffer.query.filter_by(quotation_id=quotation.id, status="Pendiente")
+            .with_for_update()
+            .all()
+        )
+        for pending_offer in invalidated_offers:
+            pending_offer.status = "Anulada"
+            pending_offer.responded_at = responded_at
+    db.session.commit()
+    payload_out = {
+        "messageId": (
+            QuotationMessage.query.filter_by(offer_id=offer.id)
+            .order_by(QuotationMessage.created_at.desc())
+            .with_entities(QuotationMessage.id)
+            .scalar()
+        ),
+        "offer": offer.to_public_dict(),
+        "quotation": quotation.to_public_dict(),
+    }
+    emit("quotation:offer:updated", payload_out, to=f"quotation:{quotation.id}")
+    for invalidated_offer in invalidated_offers:
+        message_id = (
+            QuotationMessage.query.filter_by(offer_id=invalidated_offer.id)
+            .order_by(QuotationMessage.created_at.desc())
+            .with_entities(QuotationMessage.id)
+            .scalar()
+        )
+        emit(
+            "quotation:offer:updated",
+            {
+                "messageId": message_id,
+                "offer": invalidated_offer.to_public_dict(),
+                "quotation": quotation.to_public_dict(),
+            },
+            to=f"quotation:{quotation.id}",
+        )
+    _emit_quotation_update(payload_out["quotation"])
+    return {"ok": True, **payload_out}
+
+
+def _emit_quotation_update(quotation_payload):
+    if not quotation_payload:
+        return
+    for participant_id in {quotation_payload["clientId"], quotation_payload["producerId"]}:
+        socketio.emit("quotation:updated", quotation_payload, to=f"user:{participant_id}")
+
+
 def _user_payload(user):
-    return {"user": user.to_public_dict()}
+    return {"user": user.to_account_dict()}
 
 
 def _validate_registration(payload):
@@ -760,6 +1899,7 @@ def _validate_registration(payload):
     city = str(payload.get("city", "")).strip()
     business_type = str(payload.get("businessType", "Hogar"))
     farm_name = str(payload.get("farmName", "")).strip()
+    farm_address = str(payload.get("farmAddress", "")).strip()
     association = str(payload.get("association", "")).strip()
     products = payload.get("products", [])
 
@@ -775,6 +1915,8 @@ def _validate_registration(payload):
         return None, "Selecciona una opción de saludo válida.", 400
     if role == "productor" and (not farm_name or not association or not isinstance(products, list) or not products):
         return None, "Completa los datos de tu finca, asociación y productos.", 400
+    if len(farm_address) > 500:
+        return None, "La dirección de recogida no puede superar 500 caracteres.", 400
     if not isinstance(products, list) or any(not isinstance(item, str) for item in products):
         return None, "La lista de productos no es válida.", 400
 
@@ -788,6 +1930,7 @@ def _validate_registration(payload):
         "city": city or "Montería",
         "business_type": business_type,
         "farm_name": farm_name,
+        "farm_address": farm_address,
         "association": association,
         "producer_products": list(dict.fromkeys(item.strip()[:100] for item in products if item.strip()))[:30],
     }, None, None
@@ -812,6 +1955,7 @@ def register_local_user():
         city=payload["city"],
         business_type=payload["business_type"],
         farm_name=payload["farm_name"],
+        farm_address=payload["farm_address"],
         association=payload["association"],
         status="pendiente" if payload["role"] == "productor" else "activo",
     )
@@ -848,6 +1992,34 @@ def login_local_user():
     return jsonify(_user_payload(user))
 
 
+@app.patch("/api/account/password")
+def update_account_password():
+    user = _current_user()
+    if user is None:
+        return jsonify({"error": "Inicia sesión para cambiar tu contraseña."}), 401
+    if user.password_hash is None:
+        return jsonify({"error": "Esta cuenta usa un proveedor externo para iniciar sesión y no tiene una contraseña local."}), 400
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Los datos para cambiar la contraseña no son válidos."}), 400
+    current_password = str(payload.get("currentPassword", ""))
+    new_password = str(payload.get("newPassword", ""))
+    if not current_password or not check_password_hash(user.password_hash, current_password):
+        return jsonify({"error": "La contraseña actual no es correcta."}), 400
+    if len(new_password) < 8 or len(new_password) > 256:
+        return jsonify({"error": "La nueva contraseña debe tener entre 8 y 256 caracteres."}), 400
+    if check_password_hash(user.password_hash, new_password):
+        return jsonify({"error": "La nueva contraseña debe ser diferente a la actual."}), 400
+
+    user.password_hash = generate_password_hash(new_password)
+    pending_reset = PasswordResetVerification.query.filter_by(user_id=user.id).first()
+    if pending_reset:
+        db.session.delete(pending_reset)
+    db.session.commit()
+    return jsonify({"ok": True, "message": "Contraseña actualizada correctamente."})
+
+
 def _code_hash(code):
     secret = str(app.config["SECRET_KEY"]).encode("utf-8")
     return hmac.new(secret, code.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -870,7 +2042,9 @@ def _send_settings_code(user, code):
 
 
 def _send_email_code(user, subject, content):
-    sender = os.environ.get("RESEND_FROM", os.environ.get("SMTP_FROM", "")).strip()
+    sender = os.environ.get("RESEND_FROM", "").strip() or os.environ.get(
+        "SMTP_FROM", ""
+    ).strip()
     if not sender:
         raise RuntimeError("Email delivery sender is not configured.")
 
@@ -1074,7 +2248,7 @@ def update_account_profile():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({"error": "Los datos del perfil no son válidos."}), 400
-    allowed = {"avatar", "city", "farmName", "association", "businessType"}
+    allowed = {"avatar", "city", "farmName", "farmAddress", "association", "businessType"}
     if not payload or set(payload) - allowed:
         return jsonify({"error": "El perfil incluye campos que no se pueden modificar aquí."}), 400
     if "avatar" in payload:
@@ -1104,19 +2278,23 @@ def update_account_profile():
         if user.role != "cliente" or business_type not in {"Hogar", "Restaurante", "Distribuidor", "Importador"}:
             return jsonify({"error": "El tipo de negocio no es válido para esta cuenta."}), 400
         user.business_type = business_type
-    if "farmName" in payload or "association" in payload:
+    if "farmName" in payload or "farmAddress" in payload or "association" in payload:
         if user.role != "productor":
             return jsonify({"error": "Solo el productor puede actualizar los datos de su finca."}), 403
         farm_name = payload.get("farmName", user.farm_name)
         association = payload.get("association", user.association)
+        farm_address = payload.get("farmAddress", user.farm_address)
         if not isinstance(farm_name, str) or len(farm_name.strip()) > 160:
             return jsonify({"error": "El nombre de la finca no puede superar 160 caracteres."}), 400
         if not isinstance(association, str) or len(association.strip()) > 200:
             return jsonify({"error": "La asociación no puede superar 200 caracteres."}), 400
+        if not isinstance(farm_address, str) or len(farm_address.strip()) > 500:
+            return jsonify({"error": "La dirección de recogida no puede superar 500 caracteres."}), 400
         user.farm_name = farm_name.strip()
         user.association = association.strip()
+        user.farm_address = farm_address.strip()
     db.session.commit()
-    return jsonify({"user": user.to_public_dict()})
+    return jsonify({"user": user.to_account_dict()})
 
 
 @app.post("/api/account/settings/verify-code")
@@ -1179,7 +2357,7 @@ def verify_settings_code():
     db.session.commit()
     return jsonify({
         "ok": True,
-        "user": user.to_public_dict(),
+        "user": user.to_account_dict(),
         "notifications": {
             "notificationsEnabled": settings.notifications_enabled,
             "quoteNotifications": settings.quote_notifications,
@@ -1263,7 +2441,7 @@ def current_user():
         session.clear()
         return jsonify({"error": "La sesión ya no es válida."}), 401
 
-    return jsonify({"user": user.to_public_dict()})
+    return jsonify({"user": user.to_account_dict()})
 
 
 @app.post("/api/auth/logout")
@@ -1471,6 +2649,7 @@ def _migrate_user_columns():
         "gender": "VARCHAR(20) NOT NULL DEFAULT 'neutro'",
         "phone": "VARCHAR(30) NOT NULL DEFAULT ''",
         "farm_name": "VARCHAR(160) NOT NULL DEFAULT ''",
+        "farm_address": "VARCHAR(500) NOT NULL DEFAULT ''",
         "association": "VARCHAR(200) NOT NULL DEFAULT ''",
         "status": "VARCHAR(20) NOT NULL DEFAULT 'activo'",
     }
@@ -1510,6 +2689,14 @@ def _decode_legacy_object(value, table_name, row_id):
 
 def _migrate_normalized_tables():
     """Moves legacy JSON and duplicate phone fields into relational columns."""
+    _ensure_columns(
+        "quotation_message",
+        {
+            "message_type": "VARCHAR(20) NOT NULL DEFAULT 'text'",
+            "offer_id": "VARCHAR(36) NULL REFERENCES quotation_offer(id) ON DELETE SET NULL",
+            "read_at": "TIMESTAMP NULL",
+        },
+    )
     user_columns = {column["name"] for column in inspect(db.engine).get_columns("user")}
     if "producer_products" in user_columns:
         rows = db.session.execute(
@@ -1592,6 +2779,11 @@ def _migrate_normalized_tables():
         "client_city": "VARCHAR(100) NOT NULL DEFAULT ''",
         "quantity_kg": "FLOAT NOT NULL DEFAULT 0",
         "destination_zone": "VARCHAR(40) NOT NULL DEFAULT ''",
+        "fulfillment_method": "VARCHAR(20) NOT NULL DEFAULT 'domicilio'",
+        "delivery_address": "VARCHAR(500) NOT NULL DEFAULT ''",
+        "delivery_latitude": "FLOAT NULL",
+        "delivery_longitude": "FLOAT NULL",
+        "payment_method": "VARCHAR(20) NOT NULL DEFAULT 'transferencia'",
         "freight_cop": "FLOAT NOT NULL DEFAULT 0",
         "subtotal_cop": "FLOAT NOT NULL DEFAULT 0",
         "total_cop": "FLOAT NOT NULL DEFAULT 0",
@@ -1726,6 +2918,8 @@ def _migrate_normalized_tables():
         db.session.commit()
         _drop_legacy_column("account_settings", "phone")
 
+    db.session.commit()
+
 
 with app.app_context():
     db.create_all()
@@ -1781,4 +2975,4 @@ def create_admin_command():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=os.environ.get("FLASK_DEBUG") == "true")
+    socketio.run(app, host="127.0.0.1", port=5000, debug=os.environ.get("FLASK_DEBUG") == "true")

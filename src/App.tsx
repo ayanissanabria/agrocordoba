@@ -1,4 +1,5 @@
 import React, { useState, useEffect, lazy, Suspense } from 'react';
+import { io } from 'socket.io-client';
 
 import { Navbar } from './components/Navbar';
 import { Hero } from './components/Hero';
@@ -138,6 +139,8 @@ export const App: React.FC = () => {
     }
     return INITIAL_QUOTATIONS;
   });
+  const [quotationToOpenInChat, setQuotationToOpenInChat] = useState<string | null>(null);
+  const [unreadMessageCounts, setUnreadMessageCounts] = useState<Record<string, number>>({});
 
   // =====================================================
   // USUARIO ACTUAL
@@ -254,6 +257,39 @@ export const App: React.FC = () => {
     return () => {
       active = false;
       window.removeEventListener('focus', refreshQuotations);
+    };
+  }, [currentUser?.id, currentUser?.authProvider, currentUser?.role]);
+
+  useEffect(() => {
+    if (!currentUser?.authProvider || !['cliente', 'productor'].includes(currentUser.role)) return;
+    let active = true;
+    requestProductApi<{ counts: Record<string, number> }>('/api/notifications/unread-messages')
+      .then(({ counts }) => {
+        if (active) setUnreadMessageCounts(counts);
+      })
+      .catch((error) => console.error('No se pudieron cargar los mensajes pendientes:', error));
+    return () => { active = false; };
+  }, [currentUser?.id, currentUser?.authProvider, currentUser?.role]);
+
+  useEffect(() => {
+    if (!currentUser?.authProvider || !['cliente', 'productor'].includes(currentUser.role)) {
+      setUnreadMessageCounts({});
+      return;
+    }
+    const socket = io({ withCredentials: true });
+    socket.on('quotation:updated', (updatedQuotation: QuotationRequest) => {
+      setQuotations((current) => current.map((quotation) => (
+        quotation.id === updatedQuotation.id
+          ? { ...quotation, ...updatedQuotation }
+          : quotation
+      )));
+    });
+    socket.on('quotation:unread', (update: { quotationId: string; count: number }) => {
+      setUnreadMessageCounts((current) => ({ ...current, [update.quotationId]: update.count }));
+    });
+    socket.connect();
+    return () => {
+      socket.disconnect();
     };
   }, [currentUser?.id, currentUser?.authProvider, currentUser?.role]);
 
@@ -402,35 +438,31 @@ export const App: React.FC = () => {
   // =====================================================
   // ACTUALIZAR PERFIL
   // =====================================================
-  const handleUpdateProfile = (updated: Partial<UserProfile>) => {
+  const handleUpdateProfile = async (updated: Partial<UserProfile>) => {
     if (!currentUser) {
       return;
     }
 
-    const updatedUser: UserProfile = {
+    let updatedUser: UserProfile = {
       ...currentUser,
       ...updated,
     };
 
-    setCurrentUser(updatedUser);
-
     if (currentUser.authProvider) {
       const profileChanges = Object.fromEntries(
         Object.entries(updated).filter(([key]) =>
-          ['avatar', 'city', 'farmName', 'association', 'businessType'].includes(key)
+          ['avatar', 'city', 'farmName', 'farmAddress', 'association', 'businessType'].includes(key)
         )
       );
       if (Object.keys(profileChanges).length) {
-        void requestProductApi<{ user: UserProfile }>('/api/account/profile', {
+        const { user } = await requestProductApi<{ user: UserProfile }>('/api/account/profile', {
           method: 'PATCH',
           body: JSON.stringify(profileChanges),
-        }).then(({ user }) => {
-          setCurrentUser((current) => current?.id === user.id ? user : current);
-        }).catch((error: Error) => {
-          window.alert(error.message || 'No se pudo guardar el perfil en el servidor.');
         });
+        updatedUser = { ...updatedUser, ...user };
       }
     }
+    setCurrentUser(updatedUser);
 
     // Mantener el perfil guardado aunque el usuario cierre sesión.
     // Así la foto, nombre, teléfono, municipio, etc. vuelven a aparecer
@@ -483,13 +515,18 @@ export const App: React.FC = () => {
   // =====================================================
   const handleSubmitQuotation = async (
     newQuotationData: Omit<QuotationRequest, 'id' | 'createdAt' | 'status'>
-  ) => {
+  ): Promise<QuotationRequest | void> => {
     if (currentUser?.role === 'cliente' && currentUser.authProvider) {
       const { quotation } = await requestProductApi<{ quotation: QuotationRequest }>('/api/quotations', {
         method: 'POST', body: JSON.stringify(newQuotationData),
       });
       setQuotations((prev) => [quotation, ...prev.filter((item) => item.id !== quotation.id)]);
-      return;
+      setQuotationToOpenInChat(quotation.id);
+      if (getProductIdFromPath(window.location.pathname)) {
+        window.history.replaceState({}, '', '/');
+        setSelectedProductForModal(null);
+      }
+      return quotation;
     }
     const newQuotation: QuotationRequest = {
       ...newQuotationData,
@@ -499,6 +536,7 @@ export const App: React.FC = () => {
     };
 
     setQuotations((prev) => [newQuotation, ...prev]);
+    return newQuotation;
   };
 
   // =====================================================
@@ -555,7 +593,11 @@ export const App: React.FC = () => {
     id: string,
     status: QuotationRequest['status']
   ) => {
-    if (currentUser?.role === 'productor' && currentUser.authProvider && !id.startsWith('COT-')) {
+    if (
+      ['cliente', 'productor'].includes(currentUser?.role || '') &&
+      currentUser?.authProvider &&
+      !id.startsWith('COT-')
+    ) {
       const { quotation } = await requestProductApi<{ quotation: QuotationRequest }>(`/api/quotations/${id}`, {
         method: 'PATCH', body: JSON.stringify({ status }),
       });
@@ -657,6 +699,12 @@ export const App: React.FC = () => {
               user={currentUser}
               products={products}
               quotations={quotations}
+              unreadMessageCounts={unreadMessageCounts}
+              onUpdateQuotationStatus={handleUpdateQuotationStatus}
+              openChatQuotationId={quotationToOpenInChat}
+              onQuotationChatOpened={(quotationId) => {
+                setQuotationToOpenInChat((current) => current === quotationId ? null : current);
+              }}
               onSubmitQuotation={handleSubmitQuotation}
               onNavigate={(section) => {
                 console.log('Sección del comprador:', section);
@@ -676,6 +724,7 @@ export const App: React.FC = () => {
               user={currentUser}
               products={products}
               quotations={quotations}
+              unreadMessageCounts={unreadMessageCounts}
               onAddProduct={handleAddProduct}
               onUpdateProduct={handleUpdateProduct}
               onDeleteProduct={handleDeleteProduct}

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Search,
   MapPin,
@@ -39,6 +39,19 @@ const CATEGORIES: ('Todas' | ProductCategory)[] = [
   'Otros cultivos',
 ];
 
+interface SipsaPriceReference {
+  meanPriceCop: number;
+  market: string;
+  date: string;
+}
+
+interface ProductSipsaReferences {
+  references: SipsaPriceReference[];
+  reportDate: string;
+  reportUrl: string;
+  fallbackToStoredData: boolean;
+}
+
 export const ProductCatalog: React.FC<ProductCatalogProps> = ({
   products,
   selectedMunicipality,
@@ -55,6 +68,11 @@ export const ProductCatalog: React.FC<ProductCatalogProps> = ({
   const [sortBy, setSortBy] = useState<
     'default' | 'price-asc' | 'price-desc' | 'stock-desc'
   >('default');
+  const [priceReferences, setPriceReferences] = useState<
+    Record<string, ProductSipsaReferences>
+  >({});
+  const [priceReferencesLoading, setPriceReferencesLoading] = useState(false);
+  const [priceReferencesError, setPriceReferencesError] = useState(false);
 
   const filteredProducts = useMemo(() => {
     return products
@@ -111,6 +129,62 @@ export const ProductCatalog: React.FC<ProductCatalogProps> = ({
     selectedCategory,
     sortBy,
   ]);
+
+  const productNames = useMemo(
+    () => Array.from(new Set(products.map((product) => product.name))),
+    [products],
+  );
+
+  useEffect(() => {
+    if (productNames.length === 0) {
+      setPriceReferences({});
+      setPriceReferencesLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    const loadPriceReferences = async () => {
+      setPriceReferencesLoading(true);
+      setPriceReferencesError(false);
+      try {
+        const batches: string[][] = [];
+        for (let index = 0; index < productNames.length; index += 50) {
+          batches.push(productNames.slice(index, index + 50));
+        }
+
+        const responses = await Promise.all(
+          batches.map(async (batch) => {
+            const params = new URLSearchParams();
+            batch.forEach((productName) => params.append('product', productName));
+            const response = await fetch(`/api/price-references/batch?${params}`, {
+              signal: controller.signal,
+            });
+            if (!response.ok) {
+              throw new Error('No fue posible consultar las referencias SIPSA.');
+            }
+            return (await response.json()) as {
+              referencesByProduct: Record<string, ProductSipsaReferences>;
+            };
+          }),
+        );
+        setPriceReferences(
+          Object.assign({}, ...responses.map((response) => response.referencesByProduct)),
+        );
+      } catch {
+        if (!controller.signal.aborted) {
+          setPriceReferences({});
+          setPriceReferencesError(true);
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setPriceReferencesLoading(false);
+        }
+      }
+    };
+
+    void loadPriceReferences();
+    return () => controller.abort();
+  }, [productNames]);
 
   const activeMuniName =
     selectedMunicipality === 'all'
@@ -605,6 +679,8 @@ export const ProductCatalog: React.FC<ProductCatalogProps> = ({
           <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
 
             {filteredProducts.map((product) => {
+              const officialReference = priceReferences[product.name]?.references[0];
+              const priceReferenceUrl = priceReferences[product.name]?.reportUrl;
 
               return (
 
@@ -648,6 +724,14 @@ export const ProductCatalog: React.FC<ProductCatalogProps> = ({
                       "
                       referrerPolicy="no-referrer"
                       loading="lazy"
+                      onError={(event) => {
+                        const fallback = product.name.toLowerCase().includes('yuca')
+                          ? '/images/yuca-real.jpg'
+                          : '/images/field-aerial-1.webp';
+                        if (event.currentTarget.getAttribute('src') !== fallback) {
+                          event.currentTarget.src = fallback;
+                        }
+                      }}
                     />
 
                     <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/5 to-black/10" />
@@ -801,6 +885,12 @@ export const ProductCatalog: React.FC<ProductCatalogProps> = ({
                           shrink-0
                         "
                         referrerPolicy="no-referrer"
+                        onError={(event) => {
+                          const fallback = '/images/campesinos-colombia.jpg';
+                          if (event.currentTarget.getAttribute('src') !== fallback) {
+                            event.currentTarget.src = fallback;
+                          }
+                        }}
                       />
 
                       <div className="min-w-0">
@@ -896,6 +986,44 @@ export const ProductCatalog: React.FC<ProductCatalogProps> = ({
 
                       </div>
 
+                    </div>
+
+                    <div className="mt-3 rounded-xl bg-[#f7f6ef] px-3 py-2.5">
+                      <p className="text-[10px] font-bold uppercase tracking-wider text-[#707972]">
+                        Referencia mayorista SIPSA
+                      </p>
+                      {officialReference ? (
+                        <>
+                          <p className="mt-1 text-sm font-bold text-[#003622]">
+                            {formatCop(officialReference.meanPriceCop)} COP/kg
+                          </p>
+                          <p className="text-[10px] text-[#707972]">
+                            {officialReference.market} ·{' '}
+                            {new Date(`${officialReference.date}T00:00:00`).toLocaleDateString('es-CO')}
+                            {priceReferences[product.name]?.fallbackToStoredData
+                              ? ' · último dato guardado'
+                              : ''}
+                          </p>
+                          {priceReferenceUrl && (
+                            <a
+                              href={priceReferenceUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="mt-1 inline-block text-[10px] font-semibold text-[#32634b] underline underline-offset-2"
+                            >
+                              Fuente DANE
+                            </a>
+                          )}
+                        </>
+                      ) : (
+                        <p className="mt-1 text-[10px] text-[#707972]">
+                          {priceReferencesLoading
+                            ? 'Consultando boletín oficial…'
+                            : priceReferencesError
+                              ? 'No se pudo consultar la fuente oficial.'
+                              : 'Sin dato SIPSA disponible para este producto.'}
+                        </p>
+                      )}
                     </div>
 
 

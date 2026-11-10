@@ -82,6 +82,9 @@ export interface UserProfile {
 
   farmName?: string;
 
+  /** Private pickup address; shown only to the buyer after an agreement. */
+  farmAddress?: string;
+
   association?: string;
 
   products?: string[];
@@ -238,8 +241,15 @@ export interface Product {
 export type QuotationStatus =
   | 'Pendiente'
   | 'Cotizado'
+  | 'En negociación'
+  | 'Acordado'
   | 'Contactado WhatsApp'
+  | 'Listo para recoger'
+  | 'Entregado'
   | 'Cerrado';
+
+export type FulfillmentMethod = 'domicilio' | 'recoger';
+export type PaymentMethod = 'efectivo' | 'transferencia';
 
 // ------------------------------------------------------------
 // ZONAS DE DESTINO
@@ -308,6 +318,13 @@ export interface QuotationRequest {
 
   destinationZone: DestinationZone;
 
+  fulfillmentMethod?: FulfillmentMethod;
+  deliveryAddress?: string;
+  deliveryLatitude?: number | null;
+  deliveryLongitude?: number | null;
+  paymentMethod?: PaymentMethod;
+  producerPickupAddress?: string;
+
   // ----------------------------------------------------------
   // VALORES DE LA COTIZACIÓN
   // ----------------------------------------------------------
@@ -339,4 +356,42 @@ export interface QuotationRequest {
   // ----------------------------------------------------------
 
   status: QuotationStatus;
+}
+
+export interface QuotationMessage {
+  id: string;
+  quotationId: string;
+  senderId: string;
+  senderName: string;
+  content: string;
+  messageType: 'text' | 'offer';
+  offer: QuotationOffer | null;
+  createdAt: string;
+  readAt: string | null;
+}
+
+export interface QuotationOffer {
+  id: string;
+  quotationId: string;
+  senderId: string;
+  senderName: string;
+  unitPriceCop: number;
+  quantityKg: number;
+  freightCop: number;
+  totalCop: number;
+  status: 'Pendiente' | 'Contraofertada' | 'Aceptada' | 'Rechazada';
+  createdAt: string;
+  respondedAt: string | null;
+  priceReference: {
+    productName: string;
+    priceCopKg: number;
+    market: string;
+    date: string;
+    sourceUrl: string;
+  } | null;
+  priceReferenceUnavailable: {
+    reason: string;
+    date: string;
+    sourceUrl: string;
+  } | null;
 }

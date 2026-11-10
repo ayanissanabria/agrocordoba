@@ -217,6 +217,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     useState<BusinessType>('Restaurante');
 
   const [farmName, setFarmName] = useState('');
+  const [farmAddress, setFarmAddress] = useState('');
   const [association, setAssociation] = useState('');
   const [producerProducts, setProducerProducts] = useState('');
 
@@ -411,6 +412,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     if (type === 'buyer') {
       setFarmName('');
+      setFarmAddress('');
       setAssociation('');
       setProducerProducts('');
     }
@@ -604,6 +606,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           role: registerType === 'producer' ? 'productor' : 'cliente',
           businessType: registerType === 'producer' ? 'Distribuidor' : registerBusinessType,
           farmName: farmName.trim(),
+          farmAddress: farmAddress.trim(),
           association: association.trim(),
           products: producerProducts.split(',').map((product) => product.trim()).filter(Boolean),
           password: registerPassword,
@@ -1874,6 +1877,22 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                               icon={<Store size={19} />}
                               required
                             />
+
+                            <label className="block text-sm font-bold text-slate-700">
+                              Dirección privada para recogida (opcional)
+                              <input
+                                type="text"
+                                maxLength={500}
+                                autoComplete="street-address"
+                                value={farmAddress}
+                                onChange={(event) => setFarmAddress(event.target.value)}
+                                placeholder="Dirección de la finca o punto de recogida"
+                                className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-normal text-slate-800"
+                              />
+                              <span className="mt-1 block text-xs font-normal text-slate-500">
+                                No se publica; solo se comparte con el comprador tras acordar una recogida.
+                              </span>
+                            </label>
 
                             <InputField
                               label="Asociación"
