@@ -42,6 +42,46 @@ def test_database_url_defaults_to_local_sqlite_when_unset_or_blank(monkeypatch):
     assert _get_database_url() == "sqlite:///agrocordoba.db"
 
 
+def test_database_url_uses_installed_psycopg2_driver(monkeypatch):
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql://user:pass@db.example.com:5432/agrocordoba"
+    )
+    assert _get_database_url() == (
+        "postgresql+psycopg2://user:pass@db.example.com:5432/agrocordoba"
+    )
+
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgres://user:pass@db.example.com:5432/agrocordoba"
+    )
+    assert _get_database_url() == (
+        "postgresql+psycopg2://user:pass@db.example.com:5432/agrocordoba"
+    )
+
+    explicit = "postgresql+psycopg2://user:pass@db.example.com:5432/agrocordoba"
+    monkeypatch.setenv("DATABASE_URL", explicit)
+    assert _get_database_url() == explicit
+
+
+def test_frontend_index_uses_request_origin_for_canonical(client, tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text(
+        '<link rel="canonical" href="https://agrocordoba.onrender.com/" />',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FRONTEND_DIST_DIR", str(tmp_path))
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert b'href="http://localhost/"' in response.data
+
+
+def test_robots_uses_request_origin_for_sitemap(client):
+    response = client.get("/robots.txt")
+
+    assert response.status_code == 200
+    assert "Sitemap: http://localhost/sitemap.xml" in response.get_data(as_text=True)
+
+
 def create_user(**overrides):
     values = {
         "google_sub": "google-user-123",

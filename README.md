@@ -173,6 +173,20 @@ La base PostgreSQL se conserva en un volumen entre reinicios. **No uses `docker 
 make
 ```
 
+## Desplegar en Render
+
+El repositorio incluye [`render.yaml`](./render.yaml) para crear el servicio web y la base PostgreSQL desde un Blueprint. El `Dockerfile` de la raíz compila React y ejecuta Flask/Gunicorn en el mismo origen, usando el puerto que Render asigna mediante `PORT`.
+
+1. Sube el proyecto a un repositorio de GitHub.
+2. En Render, elige **New > Blueprint**, conecta el repositorio y aplica `render.yaml`.
+3. Render genera `FLASK_SECRET_KEY`, crea PostgreSQL y configura `DATABASE_URL` y `COOKIE_SECURE=true`. No escribas secretos en el repositorio.
+4. Opcionalmente define `ADMIN_EMAIL` y `ADMIN_PASSWORD` (mínimo 12 caracteres) para crear el administrador inicial. Deben configurarse juntos.
+5. Cuando termine el despliegue, abre `https://<servicio>.onrender.com` y comprueba `https://<servicio>.onrender.com/api/health`.
+
+Ten en cuenta las limitaciones del plan gratuito: PostgreSQL vence 30 días después de crearse, el servicio web se suspende tras 15 minutos sin tráfico y no se pueden usar puertos SMTP de salida. Para conservar datos a largo plazo, cambia la base a un plan pago. Para correo en el plan gratuito usa Resend, no SMTP. Google OAuth es opcional; si lo activas, añade el origen y `https://<servicio>.onrender.com/auth/google/callback` en Google Cloud y define las variables `GOOGLE_*`.
+
+La instancia debe quedarse en **un solo worker** porque Socket.IO mantiene presencia y conexiones en memoria. Para más detalle sobre OAuth, correo y migración de datos, consulta [`backend/README.md`](./backend/README.md#despliegue-en-render).
+
 ## Comandos del Makefile
 
 Ejecuta estos comandos desde la raíz del proyecto. `make` es equivalente a `make start`; crea `.env` con secretos aleatorios si falta, conserva una configuración existente, construye las imágenes e inicia los servicios en segundo plano.

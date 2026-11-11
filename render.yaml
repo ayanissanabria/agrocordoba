@@ -1,0 +1,54 @@
+# Render Blueprint for AgroCórdoba.
+# The Dockerfile in the repository root builds the React app and serves it from
+# Flask/Gunicorn on Render's PORT, so this is a single-origin deployment.
+#
+# Free Render Postgres databases expire 30 days after creation. For a
+# long-lived deployment, change the database plan to a paid one.
+
+databases:
+  - name: agrocordoba-db
+    databaseName: agrocordoba
+    user: agrocordoba
+    plan: free
+    postgresMajorVersion: "17"
+    region: virginia
+
+services:
+  - type: web
+    name: agrocordoba
+    runtime: docker
+    plan: free
+    region: virginia
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    numInstances: 1
+    envVars:
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: agrocordoba-db
+          property: connectionString
+      - key: FLASK_DEBUG
+        value: "false"
+      - key: COOKIE_SECURE
+        value: "true"
+      # Optional: creates the first administrator on startup. Set both or
+      # neither; the password must contain at least 12 characters.
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      # Optional: Google OAuth. Add the Render URL and
+      # https://<service>.onrender.com/auth/google/callback in Google Cloud.
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      # Optional: email delivery over HTTPS. Free Render services cannot use
+      # outbound SMTP ports; Resend is the supported option there.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false

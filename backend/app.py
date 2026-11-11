@@ -44,6 +44,10 @@ def _get_database_url():
     database_url = os.environ.get("DATABASE_URL", "").strip() or "sqlite:///agrocordoba.db"
     if database_url.startswith("postgres://"):
         database_url = database_url.replace("postgres://", "postgresql://", 1)
+    # SQLAlchemy 2.1 defaults to the psycopg (v3) driver for postgresql://.
+    # The project installs psycopg2-binary, so make the driver explicit.
+    if database_url.startswith("postgresql://"):
+        database_url = database_url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return database_url
 
 
@@ -66,6 +70,23 @@ if not app.config["SECRET_KEY"]:
 db = SQLAlchemy(app)
 socketio = SocketIO(app, async_mode="threading")
 oauth = OAuth(app)
+
+
+@app.after_request
+def _apply_response_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(self)")
+    if request.path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    if request.is_secure:
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    return response
+
+
 _quotation_presence_lock = threading.Lock()
 _quotation_presence = {}
 _socket_user_ids = {}
@@ -2461,7 +2482,14 @@ def _frontend_index_content():
     if not os.path.isfile(index_path):
         return None
     with open(index_path, encoding="utf-8") as index_file:
-        return index_file.read()
+        index_html = index_file.read()
+    # The Vite template uses the original public deployment as the canonical
+    # origin. Replace it at request time so forks and custom domains expose
+    # their own URL to search engines and social previews.
+    origin = request.url_root.rstrip("/")
+    if origin:
+        index_html = index_html.replace("https://agrocordoba.onrender.com", origin)
+    return index_html
 
 
 def _product_slug(name):
@@ -2594,6 +2622,13 @@ def frontend_product_page(slug, product_id):
         1,
     )
     return app.response_class(index_html, content_type="text/html; charset=utf-8")
+
+
+@app.get("/robots.txt")
+def frontend_robots():
+    base_url = request.url_root.rstrip("/")
+    robots = f"User-agent: *\nAllow: /\n\nSitemap: {base_url}/sitemap.xml\n"
+    return app.response_class(robots, content_type="text/plain; charset=utf-8")
 
 
 @app.get("/sitemap.xml")

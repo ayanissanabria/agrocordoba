@@ -167,7 +167,9 @@ Google inicia sesión con el correo verificado. Si ese correo ya existe en la ba
 
 El backend de Docker ejecuta Gunicorn con el worker `gthread` y habilita el proxy WebSocket de Socket.IO en Nginx. En local, inicia el backend con `python app.py` y el frontend con `npm run dev`; Vite reenvía `/socket.io` al backend.
 
-La instancia existente está alojada en la cuenta de Render de un compañero; estos pasos crean una instancia independiente en tu cuenta. En Render, conecta el repositorio de GitHub y crea un **Web Service** con runtime **Docker**, rama `main` y el `Dockerfile` de la raíz (`/Dockerfile`). El Dockerfile compila el frontend y ejecuta Flask/Gunicorn en el mismo origen; Render proporciona el puerto mediante `PORT`.
+La instancia existente está alojada en la cuenta de Render de un compañero; estos pasos crean una instancia independiente en tu cuenta. También puedes desplegar con el Blueprint [`render.yaml`](../render.yaml) de la raíz, que crea el Web Service y PostgreSQL y configura las variables obligatorias.
+
+Para hacerlo manualmente, en Render conecta el repositorio de GitHub y crea un **Web Service** con runtime **Docker**, rama `main` y el `Dockerfile` de la raíz (`/Dockerfile`). El Dockerfile compila el frontend y ejecuta Flask/Gunicorn en el mismo origen; Render proporciona el puerto mediante `PORT`.
 
 Crea una base **PostgreSQL** en la misma región que el Web Service y asigna su **Internal Database URL** a `DATABASE_URL` en las variables del servicio. Configura también:
 
