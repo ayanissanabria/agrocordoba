@@ -912,6 +912,15 @@ def test_scheduled_sipsa_refresh_requires_token_and_upserts_daily_data(client, m
     assert SipsaPriceReference.query.one().price_cop_kg == 2750
 
 
+def test_sipsa_date_parser_accepts_missing_space_after_de():
+    assert app_module._parse_open_data_date(
+        "Miércoles 11 denoviembre de 2026"
+    ) == datetime(2026, 11, 11)
+    assert app_module._parse_open_data_date(
+        "Martes 10 de noviembre de 2026"
+    ) == datetime(2026, 11, 10)
+
+
 def test_sipsa_parser_selects_latest_report_and_reads_market_prices(monkeypatch):
     workbook = Workbook()
     sheet = workbook.active

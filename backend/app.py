@@ -959,7 +959,7 @@ SPANISH_MONTH_ABBREVIATIONS = {
 def _parse_open_data_date(value):
     normalized = unicodedata.normalize("NFD", str(value).casefold())
     normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
-    match = re.search(r"\b(\d{1,2}) de ([a-z]+) de (\d{4})\b", normalized)
+    match = re.search(r"\b(\d{1,2})\s*de\s*([a-z]+)\s*de\s*(\d{4})\b", normalized)
     if not match:
         return None
     month = SPANISH_MONTHS.get(match.group(2))
